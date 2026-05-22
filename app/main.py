@@ -642,7 +642,7 @@ async def _transcribe_and_translate_to_lv(
     # Run in executor: MTTranslator uses synchronous `requests`, which would
     # otherwise block the asyncio event loop for the full MT duration (and
     # while holding a supervisor claim).
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     translated_segments = await loop.run_in_executor(
         None,
         functools.partial(
