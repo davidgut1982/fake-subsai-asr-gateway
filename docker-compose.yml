@@ -17,7 +17,7 @@ services:
       # ASR timeout: 15 min (covers 2-hr movie on slow GPU)
       ASR_TIMEOUT_SECONDS: "900"
       # MT timeout per batch chunk (scales with batch size in code)
-      MT_TIMEOUT_SECONDS: "60"
+      MT_TIMEOUT_SECONDS: "180"
       # forced-aligner-lv — host port 8102 (container port 8003, on latvian_network)
       # Gateway uses network_mode: host, so we reach via host-mapped port.
       # Set ENABLE_FORCED_ALIGN=false to bypass alignment entirely (Whisper-only path).
