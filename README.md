@@ -1,236 +1,266 @@
 # fake-subsai-asr-gateway
 
-FastAPI gateway on `latvian-vm` (192.168.1.11) port **9001**. Acts as a thin HTTP
-coordinator between Bazarr's `whisperai` provider and the backend ML services. It has
-no GPU and loads no models — it adapts request formats, routes calls, and reassembles
-responses.
+A thin FastAPI gateway that adapts the [openai-whisper-asr-webservice][whisper-ws]
+HTTP protocol — the one Bazarr's `whisperai` provider speaks — to an arbitrary
+backend Whisper transcription service plus an optional machine-translation
+service. It has no GPU and loads no models; it routes calls, reshapes payloads,
+serialises concurrent requests so a small host doesn't thrash, and reassembles
+SRT/VTT/TXT/JSON responses.
+
+The gateway is what stands between Bazarr and your own self-hosted ASR + MT
+stack. Anything that speaks the asr-transcription-lv `/transcribe` shape and
+optionally the back-translator-lv `/translate/batch` shape can sit behind it.
+
+[whisper-ws]: https://github.com/ahmetoner/whisper-asr-webservice
+
+---
+
+## What it is good for
+
+- **Bazarr drop-in**: Point Bazarr's WhisperAI provider at this gateway and
+  Bazarr's standard `/asr` + `/detect-language` flow Just Works.
+- **Source × target language routing**: One `/asr` endpoint detects the source
+  language and dispatches to the right pipeline (passthrough transcribe,
+  Whisper task=translate to English, or transcribe + MT to any target).
+- **Pipeline serialisation**: Concurrent Bazarr requests are queued on disk
+  (Starlette spooled multipart) so memory peaks at one request's worth of audio
+  instead of N × audio.
+- **Optional VAD + vocal isolation + forced alignment**: Each post-processor is
+  a separate sidecar service the gateway can call when configured.
+- **GPU supervisor integration**: Coordinates with an external supervisor so
+  multiple GPU services on the same card don't trample each other.
+
+---
 
 ## Architecture
 
 ```
-Bazarr (192.168.1.10, Plex host)
-  └─ whisperai provider
-       └─ POST http://192.168.1.11:9001/{endpoint}
-
-fake-subsai-asr-gateway  (latvian-vm, host network, port 9001)
-  ├─ POST /detect-language   → asr-transcription-lv:8101  (first 30 s only)
-  ├─ POST /asr               → asr-transcription-lv:8101  → EN SRT
-  ├─ POST /asr-translate-lv  → asr-transcription-lv:8101 + back-translator-lv:8104 → LV SRT
-  └─ POST /asr-lv-native     → asr-transcription-lv:8101 (language=lv) → LV SRT
-
-asr-transcription-lv  port 8101 (internal): faster-whisper large-v3 int8_float16, RTX 3060
-back-translator-lv    port 8104 (internal): NLLB-200-distilled-600M, EN→LV
+Bazarr (whisperai provider)
+  │  POST http://your-host-ip:9001/{detect-language,asr,…}
+  ▼
+fake-subsai-asr-gateway (this repo)
+  ├─ POST /detect-language       → ASR backend (first 30 s only)
+  ├─ POST /asr                   → ASR backend → SRT/VTT/TXT/JSON
+  ├─ POST /asr-translate-lv      → ASR backend + MT backend → translated SRT
+  ├─ POST /asr-lv-native         → ASR backend (language=lv) → LV SRT
+  ├─ POST /translate             → MT backend (proxy, supervisor-mediated)
+  ├─ POST /translate/batch       → MT backend (proxy, supervisor-mediated)
+  ├─ GET  /health                → dependency reachability JSON
+  └─ GET  /status                → human-readable status board (auto-refresh 3s)
+  ▼
+Configurable backends (HTTP):
+  • ASR_URL              — Whisper service (asr-transcription-lv shape)
+  • BACK_TRANSLATOR_URL  — NLLB-200 service (back-translator-lv shape)
+  • VOCAL_ISOLATOR_URL   — Demucs isolation service (optional)
+  • FORCED_ALIGNER_URL   — MMS_FA word-timestamp refinement (optional)
+  • GPU_SUPERVISOR_URL   — claim/release coordinator (optional)
 ```
+
+The gateway is intentionally I/O-bound — every heavy operation is a downstream
+HTTP call. The container does not require a GPU, never loads a model, and is
+small enough to run with a 3.5 GB memory limit alongside the rest of the stack.
+
+---
+
+## Quickstart
+
+```bash
+# 1. Clone and adjust the env block in docker-compose.yml to point at your
+#    ASR + MT services (defaults assume host-mapped ports on localhost).
+git clone https://github.com/davidgut1982/fake-subsai-asr-gateway.git
+cd fake-subsai-asr-gateway
+
+# 2. Build and start
+docker compose up -d --build
+
+# 3. Verify
+curl -sf http://localhost:9001/health
+open http://localhost:9001/status   # human-readable status board
+```
+
+The gateway listens on port `9001`. Bazarr should be pointed at
+`http://your-host-ip:9001` in the WhisperAI provider settings.
 
 ---
 
 ## Endpoints
 
-All endpoints accept `multipart/form-data`. The primary audio field name is `audio_file`
-(openai-whisper-asr-webservice standard); `file` is accepted as a legacy alias.
-
-All endpoints also accept (and require) the following query parameters that Bazarr sends
-on every call:
+All endpoints accept `multipart/form-data`. The primary audio field name is
+`audio_file` (openai-whisper-asr-webservice standard); `file` is accepted as a
+legacy alias. Query parameters Bazarr sends on every call:
 
 | Query param | Type | Default | Notes |
 |-------------|------|---------|-------|
 | `task` | str | `transcribe` | `transcribe` or `translate` |
-| `language` | str | None | ISO 639-1 or ISO 639-2 |
-| `output` | str | `srt` | Response format — gateway always returns SRT |
-| `encode` | bool | True | `false` = upload is raw s16le PCM (see below) |
-| `video_file` | str | None | Path on Bazarr's host — logged only, never opened |
-
----
+| `language` | str | None | ISO 639-1 or ISO 639-2 (target subtitle language) |
+| `output` | str | `srt` | Response format — `srt`, `vtt`, `txt`, or `json` |
+| `encode` | bool | `true` | `false` → upload is raw s16le PCM (Bazarr default) |
+| `video_file` | str | None | Path on the caller's host — logged only, never opened |
 
 ### `POST /detect-language`
 
-Called by Bazarr before every transcription. Returns the detected language of the audio.
+Called by Bazarr before every transcription. Returns the detected language of
+the audio.
 
-**Request**: multipart `audio_file` (full audio; gateway truncates to first 30 s before forwarding)
+**Request**: multipart `audio_file` (full audio; the gateway truncates to the
+first 30 s before forwarding so Bazarr's ~30 s timeout is comfortably met).
 
 **Response**:
 ```json
-{
-    "detected_language": "english",
-    "language_code": "en"
-}
+{ "detected_language": "english", "language_code": "en" }
 ```
 
-`language_code` is ISO 639-1. Bazarr checks this field by exact key name — any other name is
-treated as absent and triggers "WhisperAI returned empty language code".
-
-**Timeout note**: Bazarr has a hardcoded ~30 s timeout on this call. The gateway truncates the
-forwarded audio to the first 30 seconds (960 000 bytes at s16le 16 kHz mono) so the ASR backend
-finishes well within that window. This truncation is applied only here — transcription endpoints
-receive the full audio.
-
----
+`language_code` is ISO 639-1. Bazarr checks this field by exact key name — any
+other shape triggers "WhisperAI returned empty language code".
 
 ### `POST /asr`
 
-Transcribes audio and returns EN SRT subtitles. This is the primary Bazarr transcription endpoint.
+Smart routing. Detects the source language (or accepts an explicit one) and
+dispatches to the matching pipeline:
 
-**Request**: multipart `audio_file`
+| src (detected) | target (`language` param) | Pipeline |
+|----------------|---------------------------|----------|
+| `en` | `en` | Whisper transcribe → EN |
+| `en` | `lv` | Whisper transcribe → NLLB EN→LV → LV |
+| `lv` | `lv` | Whisper transcribe (LV) → LV |
+| `lv` | `en` | Whisper `task=translate` → EN |
+| `*`  | `en` | Whisper `task=translate` → EN |
+| `*`  | `lv` | Whisper transcribe → NLLB src→LV (best effort) |
+| any  | (none) | Transcribe in detected source language |
 
-**Response**: `text/plain`, SRT format
-
-**Pipeline**: audio → asr-transcription-lv (Whisper, language=en) → EN segments → SRT
-
----
+ISO 639-2 codes (`lav`, `eng`) are normalised to 639-1 (`lv`, `en`) at entry.
 
 ### `POST /asr-translate-lv`
 
-Transcribes English audio, translates to Latvian, returns LV SRT.
-
-**Request**: multipart `audio_file`
-
-**Response**: `text/plain`, SRT format
-
-**Pipeline**:
-```
-audio → asr-transcription-lv (language=en) → EN segments
-      → back-translator-lv /translate/batch (eng_Latn → lvs_Latn, batch=32)
-      → LV segments → LV SRT
-```
-
-MT failure per segment: text returned as `[MT-FAIL] <original EN>`. Track remains complete.
-
----
+EN audio → LV subtitles via Whisper + NLLB-200 batch MT. Timecodes are
+preserved cue-by-cue. On MT failure for a segment, the cue is prefixed with
+`[MT-FAIL]` so the subtitle track remains complete.
 
 ### `POST /asr-lv-native`
 
-Transcribes Latvian audio directly and returns LV SRT.
+LV audio → LV subtitles via a dedicated Latvian Whisper model. Adds
+forced-aligner post-processing for tighter word boundaries.
 
-**Request**: multipart `audio_file`
+### `POST /translate` and `POST /translate/batch`
 
-**Response**: `text/plain`, SRT format
-
-**Pipeline**: audio → asr-transcription-lv (language=lv) → LV segments → LV SRT
-
----
+Thin proxies to the MT backend. The gateway claims/releases the MT service via
+the GPU supervisor on each call so long batch jobs do not starve higher-priority
+services holding their own GPU claims. Use these when a client (e.g. Lingarr)
+would otherwise hit the MT service directly and bypass coordination.
 
 ### `GET /health`
 
-Returns status of gateway and downstream dependencies.
-
-**Response**:
 ```json
-{
-    "status": "healthy",
-    "dependencies": {
-        "asr-transcription-lv": "ok",
-        "back-translator-lv": "ok"
-    }
-}
+{ "status": "ok", "dependencies": { "asr": "ok", "back_translator": "ok" } }
 ```
 
----
+### `GET /status`
 
-## Audio format handling — the `encode=false` contract
-
-Bazarr always sends `?encode=false`. Per the openai-whisper-asr-webservice spec this means:
-
-> The uploaded bytes are **raw signed 16-bit little-endian PCM at 16 kHz mono** with no
-> RIFF/WAVE container header.
-
-The gateway detects this by inspecting the first 4 bytes of the upload. If they are not
-`RIFF` (+ `WAVE` at offset 8), it wraps the bytes in a 44-byte WAV header before forwarding
-to the ASR backend (which requires a container format).
-
-**How to verify raw PCM in the field**: divide file size by 32,000 (bytes/second at s16le
-16 kHz mono). If the result matches audio duration with no overhead, it is raw PCM.
-Example: 144,574,042 bytes ÷ 32,000 = 4,517.9 s = 75 min 17 s (a real 75-minute movie).
-
-Because the gateway buffers the entire upload to inspect it, the container memory limit is
-set to **1024 MB** (raised from 256 MB during the 2026-05-05 debugging session).
+Auto-refreshing (3 s) HTML status board showing the current in-flight request,
+the queue of waiting requests, the last 20 completions, and dependency health.
+Designed to be readable on a phone or terminal browser.
 
 ---
 
-## Integration with Bazarr
+## Configuration
 
-**Gateway URL** (from Bazarr's host): `http://192.168.1.11:9001`
+All configuration is environment variables. Defaults assume the gateway runs in
+`network_mode: host` next to its backends.
 
-No path prefix is needed. Bazarr's whisperai provider appends the endpoint paths itself.
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ASR_URL` | `http://localhost:8101` | Whisper backend (openai-whisper-asr-webservice `/transcribe`) |
+| `BACK_TRANSLATOR_URL` | `http://localhost:8104` | NLLB MT backend (`/translate`, `/translate/batch`) |
+| `ASR_TIMEOUT_SECONDS` | `900` | Per-request timeout for ASR calls (long for full films) |
+| `MT_TIMEOUT_SECONDS` | `30` | Per-batch timeout for MT calls |
+| `VOCAL_ISOLATOR_URL` | `http://localhost:8106` | Optional Demucs isolation service |
+| `ENABLE_VOCAL_ISOLATION` | `true` | Set `false` to bypass vocal isolation entirely |
+| `VOCAL_ISOLATOR_TIMEOUT_S` | `1800` | 30-minute ceiling for full-film isolation |
+| `MIN_AUDIO_S_FOR_ISOLATION` | `30` | Skip isolation for clips shorter than this |
+| `FORCED_ALIGNER_URL` | `http://localhost:8102` | Optional MMS_FA aligner service |
+| `ENABLE_FORCED_ALIGN` | `true` | Set `false` to bypass alignment |
+| `GPU_SUPERVISOR_URL` | `http://localhost:8202` | Optional GPU claim/release coordinator |
+| `API_KEY` | *(empty)* | When set, require `X-API-Key` header on every non-public endpoint |
 
-### Bazarr Settings → Providers → WhisperAI
+### Authentication
 
-| Field | Value |
-|-------|-------|
-| Endpoint | `http://192.168.1.11:9001` |
-| Response format | SRT |
-| Timeout | Default (transcription); leave as-is |
+`API_KEY` controls a tiny middleware:
 
-### What Bazarr calls (per subtitle file)
+- **Empty (default)** — every endpoint is open. Suitable when the gateway is
+  reachable only from a trusted LAN.
+- **Non-empty** — every request whose path is not in `{/health, /status, /docs,
+  /redoc, /openapi.json}` must carry `X-API-Key: <value>`. Mismatches return
+  HTTP 401.
 
-1. `POST /detect-language` — language detection (~700 ms with truncation)
-2. `POST /asr` — transcription for first requested language
-3. `POST /asr` (or alternate endpoint) — transcription for second language, if configured
-
-### Configuring the EN→LV chain
-
-To get Latvian subtitles for English movies, add a second Whisper ASR provider in Bazarr
-pointed at `/asr-translate-lv`:
-
-1. Bazarr → Settings → Subtitles → Providers → Add
-2. Provider: **WhisperAI**
-3. Endpoint: `http://192.168.1.11:9001`
-4. Under Advanced, override the endpoint path to `/asr-translate-lv` if supported,
-   or configure a separate language profile that routes to this gateway for Latvian.
-
-**Alternative**: call the endpoint directly for manual generation:
-```bash
-curl -X POST \
-  -F "audio_file=@movie_audio.wav" \
-  "http://192.168.1.11:9001/asr-translate-lv?task=transcribe&language=en&output=srt&encode=false" \
-  -o movie.lv.srt
-```
+Use the second mode whenever the gateway is exposed beyond a trusted network.
 
 ---
 
-## Known limitations
+## Audio format — the `encode=false` contract
 
-### Bazarr refuses EN→LV translation for English-tagged source files
+Bazarr always sends `?encode=false`. Per the openai-whisper-asr-webservice spec
+the uploaded bytes are **raw signed 16-bit little-endian PCM at 16 kHz mono**
+with no RIFF/WAVE container header.
 
-Bazarr's whisperai provider contains a hardcoded check: if the source audio track has an
-`eng` (English) language metadata tag, the provider will not request non-English output and
-raises "Only translations to English supported!" before calling the gateway.
+The gateway detects this by inspecting the first 4 bytes of the upload. If they
+are not `RIFF` (plus `WAVE` at offset 8), it wraps the bytes in a 44-byte WAV
+header before forwarding to the ASR backend (which requires a container format).
 
-This is a restriction in Bazarr's code, not the gateway. The gateway itself handles EN→LV
-correctly. Options:
-
-1. **Strip the audio language tag** — use `mkvpropedit` before Bazarr scans the file:
-   ```bash
-   mkvpropedit movie.mkv --edit track:a1 --set language=und
-   ```
-2. **Use a different Bazarr provider** — a provider that does not have this restriction
-   can call the gateway's `/asr-translate-lv` endpoint directly.
-3. **Generate LV subtitles manually** — `curl` the gateway endpoint directly and import
-   the resulting `.srt` file into Bazarr.
-
-### MT quality
-
-NLLB-200-distilled-600M (EN→LV) produces grammatically coherent subtitles but the output
-is noticeably machine-translated. BLEU ~16-17 on EN→LV. Adequate for comprehension, not
-literary quality.
-
-### Single-host memory constraint
-
-The gateway buffers each full audio upload in RAM before forwarding (required by the raw-PCM
-detection logic). For a 2-hour movie this is approximately 230 MB. The container memory limit
-is 1024 MB, so up to 4 concurrent requests of that size would be the practical ceiling.
-In practice Bazarr serializes subtitle requests so this is not an issue.
+How to verify raw PCM in the field: divide file size by 32,000 bytes/s (s16le
+16 kHz mono). If the result matches the audio duration with no overhead, it is
+raw PCM. Example: 144,574,042 bytes ÷ 32,000 = 4,517.9 s = 75 min 17 s.
 
 ---
 
-## Performance (RTX 3060, latvian-vm)
+## GPU supervisor integration
 
-| Step | 2-hour movie |
+When `GPU_SUPERVISOR_URL` points at a running supervisor, the gateway calls
+`POST /claim/<service>` before invoking each GPU-bound dependency
+(`asr-transcription-lv`, `back-translator-lv`, `vocal-isolator-lv`) and
+`POST /release/<service>` afterwards. The supervisor implements:
+
+- **Refcount-based eviction** so multiple callers can share a service.
+- **Tiered priority** so a high-priority interactive workload temporarily
+  defers low-priority batch ones (the supervisor returns HTTP 503 with a
+  `reason: tier3_yield` body and a `Retry-After` value; the gateway converts
+  that into HTTP 503 + `Retry-After` for Bazarr, which then retries naturally).
+
+If the supervisor is unreachable the gateway degrades gracefully — it logs a
+warning per claim attempt and proceeds without coordination. Set
+`GPU_SUPERVISOR_URL` to an unreachable hostname to disable coordination
+entirely.
+
+A compatible supervisor implementation lives at
+[davidgut1982/gpu-supervisor](https://github.com/davidgut1982/gpu-supervisor).
+
+---
+
+## Performance notes
+
+Wall-clock latency for a 2-hour film, measured on a single Tesla P4 (8 GB)
+shared between Whisper int8_float16, NLLB-200-distilled-600M, and Demucs:
+
+| Step | 2-hour film |
 |------|-------------|
-| Language detection (`/detect-language`, 30-s audio) | ~700 ms |
-| Whisper ASR (EN or LV) | 10–20 min |
-| Batch MT ~1000 segments (NLLB-200) | 30–90 s |
-| SRT formatting | < 1 s |
-| **Total EN→LV** | **11–21 min** |
+| `/detect-language` (30 s of audio) | ~700 ms |
+| Whisper ASR (EN or LV, int8_float16) | 10–20 min |
+| Batch MT, ~1000 segments (NLLB-200) | 30–90 s |
+| SRT formatting | <1 s |
+| **Total EN → LV** | **11–21 min** |
+
+Memory budget for a 2-hour film, mapped to the `mem_limit: 3584m` in
+`docker-compose.yml`:
+
+| Source | Approximate size |
+|--------|------------------|
+| Vocals response from vocal-isolator (FP32) | ~2.4 GB |
+| Input audio buffer (raw PCM) | ~150 MB |
+| WAV-wrapped copy | ~150 MB |
+| Python + httpx + framework overhead | ~500 MB |
+| Margin | ~400 MB |
+
+Pipeline serialisation (`asyncio.Lock`) ensures only one request holds these
+buffers at a time — concurrent requests are queued on disk by Starlette.
 
 ---
 
@@ -238,152 +268,71 @@ In practice Bazarr serializes subtitle requests so this is not an issue.
 
 | Error | Cause | Resolution |
 |-------|-------|------------|
-| `[MT-FAIL] <text>` in SRT | NLLB batch translation failed for segment | EN text preserved; subtitle track stays complete |
-| HTTP 504 from gateway | ASR backend exceeded `ASR_TIMEOUT_SECONDS` | Increase env var (default 900 s); check ASR container |
-| HTTP 503 from gateway | Backend dependency unreachable | Check `GET /health`; restart relevant container |
-| "WhisperAI returned empty language code" (Bazarr) | `/detect-language` returned wrong shape or timed out | Check gateway logs; verify `language_code` field present |
-| "Only translations to English supported!" (Bazarr) | Source file has `eng` audio language tag | See Known limitations above |
+| `[MT-FAIL] <text>` in a cue | NLLB batch translation failed for that segment | Source text preserved; subtitle track stays complete |
+| HTTP 504 from `/asr` family | ASR backend exceeded `ASR_TIMEOUT_SECONDS` | Increase the env var, check backend health |
+| HTTP 502 from `/asr` family | ASR or MT backend unreachable | Check `GET /health`, restart the relevant container |
+| HTTP 503 + `Retry-After` | Supervisor deferred a Tier 3 claim because a higher-priority service is active | Caller (Bazarr) retries naturally on the header value |
+| HTTP 401 `Unauthorized` | `API_KEY` is set and the request did not include a matching `X-API-Key` | Provide the header or unset `API_KEY` |
+| "WhisperAI returned empty language code" (Bazarr) | `/detect-language` returned the wrong shape or timed out | Check gateway logs, verify the JSON shape |
+| "Only translations to English supported!" (Bazarr) | The source file has an `eng` audio language tag | See Known limitations |
 
 ---
 
-## Dependencies
+## Known limitations
 
-| Service | Internal port | Purpose |
-|---------|--------------|---------|
-| `asr-transcription-lv` | 8101 | Whisper large-v3 CT2 (all audio transcription) |
-| `back-translator-lv` | 8104 | NLLB-200-distilled-600M EN→LV translation |
+### Bazarr refuses EN→LV translation for English-tagged source files
 
-Check status:
-```bash
-curl http://192.168.1.11:9001/health
-```
+Bazarr's whisperai provider contains a hardcoded check: if the source audio
+track has an `eng` (English) language metadata tag, the provider will not
+request non-English output. The check fires before the gateway is called.
+Options:
+
+1. **Strip the audio language tag** with `mkvpropedit` before Bazarr scans:
+   ```bash
+   mkvpropedit movie.mkv --edit track:a1 --set language=und
+   ```
+2. **Call `/asr-translate-lv` directly** from any client that does not impose
+   the same restriction.
+3. **Generate subtitles manually**:
+   ```bash
+   curl -X POST \
+     -F "audio_file=@movie.wav" \
+     "http://your-host-ip:9001/asr-translate-lv?task=transcribe&language=en&output=srt&encode=false" \
+     -o movie.lv.srt
+   ```
+
+### MT quality
+
+NLLB-200-distilled-600M (EN→LV) produces grammatically coherent subtitles but
+the output is noticeably machine-translated. BLEU ~16-17 on EN→LV. Adequate for
+comprehension, not for literary quality.
 
 ---
 
-## Source files
+## Project layout
 
 ```
-/srv/latvian_learning/tilts-system/docker/fake-subsai-asr-gateway/
+fake-subsai-asr-gateway/
 ├── Dockerfile
-├── docker-compose.yml        # memory_limit: 1024m (raised 2026-05-05)
+├── docker-compose.yml
 ├── requirements.txt
-├── README.md                 # this file
-├── README-LV-SUBTITLES.md   # older setup guide (pipeline architecture)
+├── README.md
 └── app/
-    ├── main.py               # FastAPI endpoints, audio format helpers
-    ├── mt_translator.py      # MTTranslator: batch EN→LV via back-translator-lv
-    └── subtitle_utils.py     # segments_to_srt(), format_timestamp()
+    ├── main.py                  # FastAPI endpoints, routing, format helpers
+    ├── mt_translator.py         # Batch MT client (back-translator-lv shape)
+    ├── subtitle_utils.py        # segments_to_srt(), segments_to_vtt()
+    ├── vocal_isolator_client.py # Optional Demucs-isolation HTTP client
+    └── forced_aligner_client.py # Optional MMS_FA aligner HTTP client
 ```
 
-## Rebuild after code changes
+Rebuild after code changes:
 
 ```bash
-cd /srv/latvian_learning/tilts-system/docker/fake-subsai-asr-gateway
 docker compose up -d --build
 ```
 
 ---
 
-## Debugging reference (KB)
+## License
 
-- `kb_2f4b7ad8f9ef` — Full 6-bug debugging narrative (2026-05-05): field names, missing
-  endpoints, raw PCM detection, audio truncation for language detection, byte math
-- `kb_6ae675394b36` — openai-whisper-asr-webservice protocol gotchas: quick reference
-- `kb_0fd3e6f1360b` — Earlier research: SubsAI vs whisper-asr-webservice (2025-12-12)
-- `kb_72380ed314ce` — Alignment, audio preprocessing, and the Demucs path (2026-05-05)
-- `kb_00ddfc9b350b` — CTC vs HMM forced alignment: when to use which
-- `kb_61ab7c3b6e79` — Demucs htdemucs for ASR preprocessing: model selection, parameters, GPU budget
-
----
-
-## word_timestamps and forced-alignment integration (2026-05-05)
-
-### The timestamp drift problem
-
-faster-whisper's default segment-level timestamps drift **2–10 seconds** on long-form
-archival audio. This is not a quirk or edge case: on a 75-minute 1972 mono SDTV Latvian
-film, one test line appeared in the SRT at `00:00:10` but was actually spoken between
-`01:08` and `03:55` — approximately 3 minutes of drift. This is caused by Whisper's
-cross-attention-based timestamp estimation, which produces plausible-looking but
-acoustically unconstrained timestamps.
-
-This is **language-agnostic** — the same drift occurs on English, Latvian, or any other
-language. It is a property of the estimation algorithm, not the language model.
-
-### Fix: word_timestamps=True (words=True in the ASR backend)
-
-Pass `words=True` in the `/transcribe` request to asr-transcription-lv. This activates
-per-word DTW (Dynamic Time Warping) alignment, which post-hoc aligns each decoded word
-to the waveform. Measured accuracy: **±200–500 ms** vs 2–10 s for segment-level.
-
-**Cost**: ~20-30% additional transcription time (negligible for batch use).
-
-**SRT cue construction**: use `segment.words[0].start` and `segment.words[-1].end`
-instead of the segment-level `segment.start` / `segment.end`.
-
-**Cue length**: split segments longer than ~7 seconds at word boundaries regardless of
-timestamp accuracy — this is a viewer readability constraint, not a timing issue.
-
-### forced-aligner-lv (MMS_FA) — what it is and what it actually does
-
-The `forced-aligner-lv` service uses **torchaudio MMS_FA** (Meta's Massively Multilingual
-Speech Forced Alignment), a wav2vec2-based CTC aligner. It is **not** classical Montreal
-Forced Aligner (MFA). The distinction matters for understanding its failure modes.
-
-MMS_FA takes Whisper's decoded text and the audio waveform and refines the word timestamps
-using CTC forced alignment. It reports a per-segment confidence score. Segments with "poor"
-confidence should fall back to the Whisper word_timestamps values.
-
-**Real-world results on 75-min 1972 SDTV film**:
-
-| Metric | Value |
-|--------|-------|
-| Total Whisper segments | 111 |
-| MMS_FA accepted (good quality) | 34 (31%) |
-| Fell back to Whisper DTW | 77 (69%) |
-| Improvement per accepted cue | +40 ms tighter (median) |
-
-The 69% fallback is correct behavior. MMS_FA is honest about its limits: 1972 SDTV audio
-is outside its training distribution (modern clean speech). The fallback to word_timestamps
-still produces substantially better output than the default segment-level estimates.
-
-On modern HD content, MMS_FA acceptance rate is expected to reach 80–95%.
-
-### Volume permissions fix (forced-aligner-lv)
-
-The service was in `degraded` state for 27 days due to a permissions issue.
-
-**Root cause**: container runs as `appuser`; the `latvian_models_data` Docker volume was
-owned by `root:root 0755`. The model download on first start failed silently.
-
-**Fix** (run on the host before restarting the container):
-```bash
-chmod 777 /var/lib/docker/volumes/latvian_models_data/_data/
-docker compose restart forced-aligner-lv
-```
-
-The ~1.2 GB MMS_FA model then downloaded successfully on restart.
-
-### The Demucs preprocessing path (research phase — not yet implemented)
-
-The 69% MMS_FA fallback rate traces to Whisper hallucinating text on music/ambient
-sections of the mixed audio. The fix is upstream: strip music before Whisper sees the
-audio using **Demucs `htdemucs`** vocal isolation.
-
-**Decision rule for preprocessing**:
-- Modern HD film (clean audio): Whisper + word_timestamps only (~7 min per 75-min film)
-- Archival/SDTV film (music+dialogue mix): DeepFilterNet 3 → Demucs htdemucs → Whisper
-  + word_timestamps (~25-30 min per 75-min film)
-
-**GPU constraint**: Demucs requires ~3 GB VRAM; asr-transcription-lv holds ~1.9 GB.
-They cannot coexist. Operational pattern: stop asr-transcription-lv → run Demucs
-(~20 min) → restart asr-transcription-lv → run Whisper+alignment.
-
-**Critical parameters**:
-- Model: `htdemucs` (not `htdemucs_ft` — 4x slower for no benefit on archival audio)
-- Never use Spleeter — it introduces phase artifacts that break forced alignment
-- `--two-stems=vocals` does NOT speed up processing (always runs full 4-stem internally)
-- Cache vocal stems by SHA-256 content hash; ~150 MB per 75-min film
-
-See `kb_61ab7c3b6e79` for full operational detail on Demucs parameters and GPU budget,
-and `kb_72380ed314ce` for the complete preprocessing pipeline design.
+See repository for license terms.

@@ -32,8 +32,13 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import ctypes
+import datetime
 import functools
+import gc
+import html
 import io
+import json
 import logging
 import os
 import struct
@@ -106,6 +111,23 @@ ASR_TIMEOUT = float(os.environ.get("ASR_TIMEOUT_SECONDS", "900.0"))
 
 # HTTP client timeout for translation calls
 MT_TIMEOUT = float(os.environ.get("MT_TIMEOUT_SECONDS", "30.0"))
+
+# Optional API key authentication.
+# When API_KEY env var is set (non-empty), every request to a non-public endpoint
+# must include header X-API-Key: <value>. When unset (default), the gateway is
+# open — suitable for a private homelab network behind a firewall. Set this
+# whenever the gateway is reachable from an untrusted network.
+API_KEY = os.getenv("API_KEY", "")
+
+# Paths that bypass API key enforcement so health checks, docs, and the status
+# board remain reachable for monitoring without leaking credentials.
+_API_KEY_EXEMPT_PATHS: frozenset[str] = frozenset({
+    "/health",
+    "/status",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+})
 
 # ── Language code normalization ────────────────────────────────────────────────
 #
@@ -228,7 +250,6 @@ def _format_output(
         return Response(content=body, media_type="text/plain")
 
     if fmt == "json":
-        import json as _json
         payload = {
             "text": " ".join(
                 seg.get("text", "").strip() for seg in segments
@@ -237,7 +258,7 @@ def _format_output(
             "language": detected_language or "",
             "segments": segments,
         }
-        return Response(content=_json.dumps(payload), media_type="application/json")
+        return Response(content=json.dumps(payload), media_type="application/json")
 
     # Unknown format — fall back to SRT (safe default for Bazarr)
     log.warning("Unknown output format %r, falling back to SRT", output_format)
@@ -381,6 +402,28 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+
+# ── Optional API key middleware ────────────────────────────────────────────────
+
+
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    """Why: Allow the same Docker image to run in two trust modes — open (homelab
+    LAN behind a firewall) or authenticated (any deployment exposed to an
+    untrusted network) — controlled by a single env var, with no code change.
+    What: If API_KEY env var is non-empty, require header X-API-Key on every
+    request whose path is not in _API_KEY_EXEMPT_PATHS (/health, /status, /docs,
+    /redoc, /openapi.json). Mismatches return HTTP 401. If API_KEY is empty,
+    every request is allowed through (current homelab behaviour).
+    Test: Set API_KEY=secret, POST /asr without the header → expect 401; POST
+    with X-API-Key: secret → expect normal pipeline response. Leave API_KEY
+    unset and POST /asr without the header → expect normal pipeline response.
+    """
+    if API_KEY and request.url.path not in _API_KEY_EXEMPT_PATHS:
+        if request.headers.get("X-API-Key", "") != API_KEY:
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
 
 
 # ── Exception handler ──────────────────────────────────────────────────────────
@@ -987,6 +1030,53 @@ def _get_audio_field(
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
+def _finalize_pipeline_request(
+    endpoint: str,
+    video_file: str,
+    started_at: float,
+    status: str,
+) -> None:
+    """Why: The three /asr-family endpoints share an identical post-pipeline
+    cleanup block (ring-buffer append, _in_progress_request reset, gc/malloc_trim
+    to drop multi-GB audio buffers, queue cleanup). Centralising it eliminates
+    three copies that drifted on previous edits and made future changes risky.
+    What: Captures stage_at_failure from the in-progress request, appends a
+    completion record to _recent_completions, clears _in_progress_request, then
+    forces a gc + glibc malloc_trim to return arena memory to the OS so RSS
+    drops back to baseline between requests.
+    Test: Set _in_progress_request to a dict with stage='whisper'; call with
+    status='failed'; assert _recent_completions[0]['stage_at_failure'] ==
+    'whisper' and _in_progress_request is None. Call with status='complete';
+    assert stage_at_failure is None.
+    """
+    global _in_progress_request
+    ended_at = time.monotonic()
+    stage_at_failure = (
+        _in_progress_request.get("stage", "?")
+        if status == "failed" and _in_progress_request is not None
+        else None
+    )
+    _recent_completions.appendleft({
+        "endpoint": endpoint,
+        "video_file": video_file,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "status": status,
+        "stage_at_failure": stage_at_failure,
+        "duration_sec": ended_at - started_at,
+    })
+    _in_progress_request = None
+
+    # Free Python objects + return glibc arena memory to OS so RSS drops back
+    # to baseline between requests. Without this, the vocals response buffer
+    # (up to ~2.4 GB for 2-hr films) stays pinned in Python's heap pool.
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def _fmt_duration(seconds: float) -> str:
     """Format a duration in seconds as 'Xm Ys' or 'Xs'."""
     secs = int(seconds)
@@ -997,7 +1087,6 @@ def _fmt_duration(seconds: float) -> str:
 
 def _fmt_time(ts: float) -> str:
     """Format a monotonic timestamp as HH:MM:SS (wall clock approximation)."""
-    import datetime
     # Convert monotonic to wall time by anchoring to now
     wall = datetime.datetime.now() - datetime.timedelta(seconds=time.monotonic() - ts)
     return wall.strftime("%H:%M:%S")
@@ -1042,15 +1131,18 @@ async def status_page() -> HTMLResponse:
     queue_str = f"QUEUE: {queue_len} waiting" if queue_len else "QUEUE: empty"
 
     # ── Current request block ──────────────────────────────────────────────
+    # All dynamic values are html.escape()d before interpolation because
+    # video_file comes from Bazarr (user-controlled filename) and stage labels
+    # contain runtime-formatted strings. Escaping closes XSS via crafted paths.
     if _in_progress_request:
         ip = _in_progress_request
         elapsed = now - ip["started_at"]
         current_html = f"""<div class="section">
 <div class="section-title">CURRENT REQUEST</div>
-  Endpoint: {ip['endpoint']}
-  Video:    {ip.get('video_file') or '(unknown)'}
-  Stage:    {ip.get('stage', '—')}
-  Started:  {_fmt_time(ip['started_at'])} ({_fmt_duration(elapsed)} ago)
+  Endpoint: {html.escape(str(ip['endpoint']))}
+  Video:    {html.escape(str(ip.get('video_file') or '(unknown)'))}
+  Stage:    {html.escape(str(ip.get('stage', '—')))}
+  Started:  {html.escape(_fmt_time(ip['started_at']))} ({html.escape(_fmt_duration(elapsed))} ago)
 </div>"""
     else:
         current_html = '<div class="section"><div class="section-title">CURRENT REQUEST</div>  —— IDLE ——\n</div>'
@@ -1060,8 +1152,11 @@ async def status_page() -> HTMLResponse:
         rows = []
         for i, entry in enumerate(_queue, 1):
             waited = now - entry["queued_at"]
-            vf = (entry.get("video_file") or "(unknown)")[:60]
-            rows.append(f"  {i}. {entry['endpoint']}  {vf}   (waiting {_fmt_duration(waited)})")
+            vf = (str(entry.get("video_file") or "(unknown)"))[:60]
+            rows.append(
+                f"  {i}. {html.escape(str(entry['endpoint']))}  {html.escape(vf)}   "
+                f"(waiting {html.escape(_fmt_duration(waited))})"
+            )
         queue_html = '<div class="section"><div class="section-title">QUEUE (in order)</div>\n' + "\n".join(rows) + "\n</div>"
     else:
         queue_html = '<div class="section"><div class="section-title">QUEUE</div>  (empty)\n</div>'
@@ -1071,16 +1166,18 @@ async def status_page() -> HTMLResponse:
         rows = []
         for entry in _recent_completions:
             duration = entry["ended_at"] - entry["started_at"]
-            vf = (entry.get("video_file") or "(unknown)")[:55]
-            status = entry.get("status", "?").upper()
+            vf = (str(entry.get("video_file") or "(unknown)"))[:55]
+            status = str(entry.get("status", "?")).upper()
             status_class = "ok" if status == "COMPLETE" else "err"
             if status == "FAILED":
-                stage_info = f"  stage={entry.get('stage_at_failure', '?')}"
+                stage_info = f"  stage={html.escape(str(entry.get('stage_at_failure', '?')))}"
             else:
                 stage_info = ""
             rows.append(
-                f'  {_fmt_time(entry["started_at"])}  {entry["endpoint"]}  {vf}   '
-                f'<span class="{status_class}">{status}</span>{stage_info}  {_fmt_duration(duration)}'
+                f'  {html.escape(_fmt_time(entry["started_at"]))}  {html.escape(str(entry["endpoint"]))}  '
+                f'{html.escape(vf)}   '
+                f'<span class="{status_class}">{html.escape(status)}</span>{stage_info}  '
+                f'{html.escape(_fmt_duration(duration))}'
             )
         completions_html = (
             '<div class="section"><div class="section-title">RECENT COMPLETIONS (last 20)</div>\n'
@@ -1094,7 +1191,9 @@ async def status_page() -> HTMLResponse:
     dep_rows = []
     for name, result in dep_results.items():
         cls = "ok" if result == "ok" else "err"
-        dep_rows.append(f'  {name:<28} <span class="{cls}">{result}</span>')
+        dep_rows.append(
+            f'  {html.escape(str(name)):<28} <span class="{cls}">{html.escape(str(result))}</span>'
+        )
     deps_html = (
         '<div class="section"><div class="section-title">DEPENDENCIES</div>\n'
         + "\n".join(dep_rows)
@@ -1128,7 +1227,7 @@ async def status_page() -> HTMLResponse:
 <body>
 <h1>GATEWAY STATUS</h1>
 <div class="subtitle">auto-refresh 3s &mdash; {time.strftime("%Y-%m-%d %H:%M:%S")}</div>
-<div class="state-line">State: {state_str} &nbsp;&nbsp;|&nbsp;&nbsp; {queue_str}</div>
+<div class="state-line">State: {html.escape(state_str)} &nbsp;&nbsp;|&nbsp;&nbsp; {html.escape(queue_str)}</div>
 {current_html}
 {queue_html}
 {completions_html}
@@ -1495,37 +1594,16 @@ async def asr_smart(
                 _status = "failed"
                 raise
             finally:
-                # Record completion in ring buffer — capture stage_at_failure
-                # from _in_progress_request before we null it out.
-                ended_at = time.monotonic()
-                stage_at_failure = (
-                    _in_progress_request.get("stage", "?")
-                    if _status == "failed" and _in_progress_request is not None
-                    else None
+                # Drop multi-GB audio buffers before _finalize_pipeline_request
+                # forces gc + malloc_trim — otherwise the trim cannot reclaim them.
+                audio_bytes = None  # type: ignore[assignment]
+                audio_for_asr = None  # type: ignore[assignment]  # vocals buffer (up to ~2.4 GB)
+                _finalize_pipeline_request(
+                    endpoint="/asr",
+                    video_file=video_file or filename,
+                    started_at=started_at,
+                    status=_status,
                 )
-                _recent_completions.appendleft({
-                    "endpoint": "/asr",
-                    "video_file": video_file or filename,
-                    "started_at": started_at,
-                    "ended_at": ended_at,
-                    "status": _status,
-                    "stage_at_failure": stage_at_failure,
-                    "duration_sec": ended_at - started_at,
-                })
-                _in_progress_request = None
-
-                # Free Python objects + return glibc arena memory to OS so RSS drops
-                # back to baseline between requests. Without this, the vocals response
-                # buffer (up to ~2.4 GB for 2-hr films) stays in Python's heap pool.
-                import gc
-                import ctypes
-                audio_bytes = None  # type: ignore[assignment]  # ensure dropped
-                audio_for_asr = None  # type: ignore[assignment]  # vocals buffer (up to ~2.4 GB for 2-hr films) — release before malloc_trim
-                gc.collect()
-                try:
-                    ctypes.CDLL("libc.so.6").malloc_trim(0)
-                except Exception:
-                    pass
     except GpuYieldError as yield_err:
         # Policy B (2026-05-06): Tier 3 service was deferred because a higher-priority
         # service is active. Return 503 + Retry-After to Bazarr so it retries naturally.
@@ -1548,7 +1626,8 @@ async def asr_smart(
         except ValueError:
             pass
 
-    assert result is not None
+    if result is None:
+        raise HTTPException(status_code=500, detail="Pipeline produced no result")
     return result
 
 
@@ -1668,33 +1747,13 @@ async def asr_translate_lv(
                 _status = "failed"
                 raise
             finally:
-                ended_at = time.monotonic()
-                stage_at_failure = (
-                    _in_progress_request.get("stage", "?")
-                    if _status == "failed" and _in_progress_request is not None
-                    else None
-                )
-                _recent_completions.appendleft({
-                    "endpoint": "/asr-translate-lv",
-                    "video_file": filename,
-                    "started_at": started_at,
-                    "ended_at": ended_at,
-                    "status": _status,
-                    "stage_at_failure": stage_at_failure,
-                    "duration_sec": ended_at - started_at,
-                })
-                _in_progress_request = None
-
-                # Free Python objects + return glibc arena memory to OS so RSS drops
-                # back to baseline between requests.
-                import gc
-                import ctypes
                 audio_bytes = None  # type: ignore[assignment]
-                gc.collect()
-                try:
-                    ctypes.CDLL("libc.so.6").malloc_trim(0)
-                except Exception:
-                    pass
+                _finalize_pipeline_request(
+                    endpoint="/asr-translate-lv",
+                    video_file=filename,
+                    started_at=started_at,
+                    status=_status,
+                )
     except GpuYieldError as yield_err:
         # Policy B (2026-05-06): Tier 3 service was deferred because a higher-priority
         # service is active. Return 503 + Retry-After to Bazarr so it retries naturally.
@@ -1716,7 +1775,8 @@ async def asr_translate_lv(
         except ValueError:
             pass
 
-    assert result is not None
+    if result is None:
+        raise HTTPException(status_code=500, detail="Pipeline produced no result")
     return result
 
 
@@ -1831,33 +1891,13 @@ async def asr_lv_native(
                 _status = "failed"
                 raise
             finally:
-                ended_at = time.monotonic()
-                stage_at_failure = (
-                    _in_progress_request.get("stage", "?")
-                    if _status == "failed" and _in_progress_request is not None
-                    else None
-                )
-                _recent_completions.appendleft({
-                    "endpoint": "/asr-lv-native",
-                    "video_file": filename,
-                    "started_at": started_at,
-                    "ended_at": ended_at,
-                    "status": _status,
-                    "stage_at_failure": stage_at_failure,
-                    "duration_sec": ended_at - started_at,
-                })
-                _in_progress_request = None
-
-                # Free Python objects + return glibc arena memory to OS so RSS drops
-                # back to baseline between requests.
-                import gc
-                import ctypes
                 audio_bytes = None  # type: ignore[assignment]
-                gc.collect()
-                try:
-                    ctypes.CDLL("libc.so.6").malloc_trim(0)
-                except Exception:
-                    pass
+                _finalize_pipeline_request(
+                    endpoint="/asr-lv-native",
+                    video_file=filename,
+                    started_at=started_at,
+                    status=_status,
+                )
     except GpuYieldError as yield_err:
         # Policy B (2026-05-06): Tier 3 service was deferred because a higher-priority
         # service is active. Return 503 + Retry-After to Bazarr so it retries naturally.
@@ -1879,7 +1919,8 @@ async def asr_lv_native(
         except ValueError:
             pass
 
-    assert result is not None
+    if result is None:
+        raise HTTPException(status_code=500, detail="Pipeline produced no result")
     return result
 
 

@@ -157,7 +157,7 @@ class MTTranslator:
                     "source_lang": source_lang,
                     "target_lang": target_lang,
                 },
-                timeout=self.timeout * len(texts),  # scale timeout with batch size
+                timeout=self.timeout,  # per-batch flat timeout (not scaled by size)
             )
             r.raise_for_status()
             translations = r.json().get("translations", [])

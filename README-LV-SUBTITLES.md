@@ -47,8 +47,8 @@ Add a **second** Whisper ASR provider entry in Bazarr:
 
 1. Open Bazarr → Settings → Subtitles → Whisper ASR
 2. Add a new provider with:
-   - **URL**: `http://localhost:9001/asr-translate-lv`
-     (or `http://192.168.1.11:9001/asr-translate-lv` from the network)
+   - **URL**: `http://your-host-ip:9001/asr-translate-lv`
+     (or `http://localhost:9001/asr-translate-lv` if Bazarr is on the same host)
    - **Language**: Latvian
 3. Create a language profile for Latvian using this provider.
 4. Apply the Latvian language profile to movies in your library.
@@ -102,7 +102,7 @@ curl http://localhost:9001/health
 ## Source Files
 
 ```
-/srv/latvian_learning/tilts-system/docker/fake-subsai-asr-gateway/
+fake-subsai-asr-gateway/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -116,7 +116,7 @@ curl http://localhost:9001/health
 ## Rebuild After Code Changes
 
 ```bash
-cd /srv/latvian_learning/tilts-system/docker/fake-subsai-asr-gateway
+cd fake-subsai-asr-gateway
 docker compose build
 docker compose up -d
 ```

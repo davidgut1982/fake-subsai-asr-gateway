@@ -6,8 +6,8 @@ services:
     container_name: fake-subsai-asr-gateway
     # host network: simplest way to reach asr-transcription-lv:8101 and
     # back-translator-lv:8104 which are bound to host ports.
-    # Bazarr (when running on the host or with host networking) reaches the
-    # gateway at http://localhost:9001/asr or http://192.168.1.11:9001/asr.
+    # Bazarr reaches the gateway at http://your-host-ip:9001/asr
+    # (or http://localhost:9001/asr if Bazarr is on the same host).
     network_mode: host
     environment:
       # asr-transcription-lv — host port 8101
@@ -33,6 +33,12 @@ services:
       MIN_AUDIO_S_FOR_ISOLATION: "30"
       # gpu-supervisor-lv — host port 8202 (gateway uses network_mode: host)
       GPU_SUPERVISOR_URL: "http://localhost:8202"
+      # Optional API key authentication.
+      # Leave empty (default) for an open homelab deployment behind a firewall.
+      # Set to a strong random string to require X-API-Key on every non-public
+      # endpoint when the gateway is reachable from an untrusted network.
+      # Exempt paths (always open): /health, /status, /docs, /redoc, /openapi.json.
+      API_KEY: ""
     restart: unless-stopped
     # Memory budget (revised 2026-05-06 for 2-hr film support):
     #   Vocals response from vocal-isolator (2-hr film, FP32):  ~2.4 GB
