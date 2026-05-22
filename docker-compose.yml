@@ -1,0 +1,57 @@
+services:
+  fake-subsai-asr-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fake-subsai-asr-gateway
+    # host network: simplest way to reach asr-transcription-lv:8101 and
+    # back-translator-lv:8104 which are bound to host ports.
+    # Bazarr (when running on the host or with host networking) reaches the
+    # gateway at http://localhost:9001/asr or http://192.168.1.11:9001/asr.
+    network_mode: host
+    environment:
+      # asr-transcription-lv — host port 8101
+      ASR_URL: http://localhost:8101
+      # back-translator-lv — host port 8104
+      BACK_TRANSLATOR_URL: http://localhost:8104
+      # ASR timeout: 15 min (covers 2-hr movie on slow GPU)
+      ASR_TIMEOUT_SECONDS: "900"
+      # MT timeout per batch chunk (scales with batch size in code)
+      MT_TIMEOUT_SECONDS: "60"
+      # forced-aligner-lv — host port 8102 (container port 8003, on latvian_network)
+      # Gateway uses network_mode: host, so we reach via host-mapped port.
+      # Set ENABLE_FORCED_ALIGN=false to bypass alignment entirely (Whisper-only path).
+      FORCED_ALIGNER_URL: http://localhost:8102
+      ENABLE_FORCED_ALIGN: "true"
+      # vocal-isolator-lv — host port 8106 (container port 8003; 8105 is taken by fluency-gate-roberta-lv)
+      # Gateway uses network_mode: host, so we reach via host-mapped port.
+      # Set ENABLE_VOCAL_ISOLATION=false to bypass pre-processing entirely.
+      VOCAL_ISOLATOR_URL: http://localhost:8106
+      ENABLE_VOCAL_ISOLATION: "true"
+      VOCAL_ISOLATOR_TIMEOUT_S: "1800"
+      # Minimum audio duration (seconds) to run isolation — short clips get skipped.
+      MIN_AUDIO_S_FOR_ISOLATION: "30"
+      # gpu-supervisor-lv — host port 8202 (gateway uses network_mode: host)
+      GPU_SUPERVISOR_URL: "http://localhost:8202"
+    restart: unless-stopped
+    # Memory budget (revised 2026-05-06 for 2-hr film support):
+    #   Vocals response from vocal-isolator (2-hr film, FP32):  ~2.4 GB
+    #   Input audio buffer (raw PCM, ~144 MB for 2-hr film):    ~150 MB
+    #   WAV-wrapped copy:                                        ~150 MB
+    #   Python + httpx + framework overhead:                     ~500 MB
+    #   Margin:                                                  ~400 MB
+    # Total: 3.5 GB. Pipeline serialization (asyncio.Lock) ensures only one
+    # request holds these buffers at a time — concurrent requests queue on disk.
+    # HOST RAM constraint: 12 GB total across all services.
+    mem_limit: 3584m
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

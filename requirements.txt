@@ -1,0 +1,9 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+httpx>=0.27.0
+requests>=2.31.0
+# Audio downsampling for vocal-isolator output (44.1kHz stereo float32 → 16kHz mono int16)
+numpy>=1.24.0
+soundfile>=0.12.0
+scipy>=1.11.0
