@@ -1633,13 +1633,28 @@ async def asr_translate_lv(
             )
 
             try:
-                # Transcribe + MT-translate to LV (timecodes preserved cue-by-cue)
-                translated_segments = await _transcribe_and_translate_to_lv(
-                    client, mt, audio_bytes, filename, src_lang=asr_lang
-                )
-                log.info("/asr-translate-lv  complete — %d segments", len(translated_segments))
-                _in_progress_request["stage"] = "done"
-                result = _format_output(translated_segments, output_fmt, "lv")
+                # Claim asr-transcription-lv + back-translator-lv via supervisor.
+                # No vocal-isolator claim here: this endpoint does not invoke
+                # _isolate_vocals_if_appropriate (Whisper runs directly on the
+                # incoming WAV). If isolation is added later, prepend
+                # "vocal-isolator-lv" to services_to_claim when it will run.
+                services_to_claim: list[str] = [
+                    "asr-transcription-lv",
+                    "back-translator-lv",
+                ]
+                async with _supervisor_session(services_to_claim):
+                    # Transcribe + MT-translate to LV (timecodes preserved cue-by-cue)
+                    translated_segments = await _transcribe_and_translate_to_lv(
+                        client, mt, audio_bytes, filename, src_lang=asr_lang
+                    )
+                    log.info("/asr-translate-lv  complete — %d segments", len(translated_segments))
+                    _in_progress_request["stage"] = "done"
+                    result = _format_output(translated_segments, output_fmt, "lv")
+            except GpuYieldError:
+                # Tier 3 yield (Policy B): mark as deferred, re-raise for outer
+                # handler to convert to HTTP 503 + Retry-After for Bazarr.
+                _status = "deferred"
+                raise
             except Exception:
                 _status = "failed"
                 raise
@@ -1671,6 +1686,21 @@ async def asr_translate_lv(
                     ctypes.CDLL("libc.so.6").malloc_trim(0)
                 except Exception:
                     pass
+    except GpuYieldError as yield_err:
+        # Policy B (2026-05-06): Tier 3 service was deferred because a higher-priority
+        # service is active. Return 503 + Retry-After to Bazarr so it retries naturally.
+        log.info(
+            "/asr-translate-lv deferred: GPU busy with %s — Bazarr will retry in %ds",
+            yield_err.active, yield_err.retry_after,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "GPU busy with higher-priority services. Try again later.",
+                "active_services": yield_err.active,
+            },
+            headers={"Retry-After": str(yield_err.retry_after)},
+        )
     finally:
         try:
             _queue.remove(queue_entry)
@@ -1764,19 +1794,30 @@ async def asr_lv_native(
             )
 
             try:
-                segments, detected = await _whisper_chunked(
-                    audio_bytes, language=lang, task="transcribe", client=client
-                )
-                log.info("/asr-lv-native  done — %d segments", len(segments))
+                # Claim asr-transcription-lv via supervisor. No back-translator-lv
+                # (no MT step in this endpoint). No vocal-isolator-lv (this endpoint
+                # does not invoke _isolate_vocals_if_appropriate). forced-aligner-lv
+                # is CPU-only and not under supervisor control.
+                services_to_claim: list[str] = ["asr-transcription-lv"]
+                async with _supervisor_session(services_to_claim):
+                    segments, detected = await _whisper_chunked(
+                        audio_bytes, language=lang, task="transcribe", client=client
+                    )
+                    log.info("/asr-lv-native  done — %d segments", len(segments))
 
-                # Refine word timestamps via forced-aligner-lv (Latvian audio only endpoint)
-                _in_progress_request["stage"] = "forced-align"
-                segments = await _refine_segments_with_alignment(
-                    segments, audio_bytes, sample_rate=16000
-                )
+                    # Refine word timestamps via forced-aligner-lv (Latvian audio only endpoint)
+                    _in_progress_request["stage"] = "forced-align"
+                    segments = await _refine_segments_with_alignment(
+                        segments, audio_bytes, sample_rate=16000
+                    )
 
-                _in_progress_request["stage"] = "done"
-                result = _format_output(segments, output_fmt, detected or lang)
+                    _in_progress_request["stage"] = "done"
+                    result = _format_output(segments, output_fmt, detected or lang)
+            except GpuYieldError:
+                # Tier 3 yield (Policy B): mark as deferred, re-raise for outer
+                # handler to convert to HTTP 503 + Retry-After for Bazarr.
+                _status = "deferred"
+                raise
             except Exception:
                 _status = "failed"
                 raise
@@ -1808,6 +1849,21 @@ async def asr_lv_native(
                     ctypes.CDLL("libc.so.6").malloc_trim(0)
                 except Exception:
                     pass
+    except GpuYieldError as yield_err:
+        # Policy B (2026-05-06): Tier 3 service was deferred because a higher-priority
+        # service is active. Return 503 + Retry-After to Bazarr so it retries naturally.
+        log.info(
+            "/asr-lv-native deferred: GPU busy with %s — Bazarr will retry in %ds",
+            yield_err.active, yield_err.retry_after,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "GPU busy with higher-priority services. Try again later.",
+                "active_services": yield_err.active,
+            },
+            headers={"Retry-After": str(yield_err.retry_after)},
+        )
     finally:
         try:
             _queue.remove(queue_entry)
@@ -1816,6 +1872,76 @@ async def asr_lv_native(
 
     assert result is not None
     return result
+
+
+# ── Lingarr text-translation proxy ─────────────────────────────────────────────
+
+
+@app.post(
+    "/translate",
+    summary="Text translation proxy (claims back-translator-lv via supervisor)",
+    tags=["translation"],
+)
+async def translate_proxy(request: Request) -> Response:
+    """Why: Lingarr currently calls back-translator-lv at :8104 directly, bypassing
+    the GPU supervisor entirely. Routing through this proxy lets Lingarr point at
+    the gateway (port 9001) so the supervisor can mediate claim/release for the
+    text-translation path the same way it does for ASR.
+    What: Claims back-translator-lv via _supervisor_session, forwards the request
+    body to back-translator-lv's /translate (single-text JSON shape used by Lingarr),
+    and returns the response verbatim. Releases the service after the response.
+    Test: POST a JSON body {"text": "hello", "source_lang": "eng_Latn",
+    "target_lang": "lvs_Latn"} and assert the response status mirrors back-translator's
+    and the JSON includes a "translation" key. With a higher-priority service active,
+    assert a 503 with Retry-After is returned instead.
+    """
+    client = _get_client()
+
+    # Read body once — must be reusable for forwarding even if claim succeeds.
+    body = await request.body()
+    content_type = request.headers.get("content-type", "application/json")
+
+    try:
+        async with _supervisor_session(["back-translator-lv"]):
+            try:
+                upstream = await client.post(
+                    f"{BACK_TRANSLATOR_URL}/translate",
+                    content=body,
+                    headers={"content-type": content_type},
+                    timeout=MT_TIMEOUT,
+                )
+            except httpx.TimeoutException as exc:
+                log.error("/translate proxy: back-translator timeout: %s", exc)
+                raise HTTPException(
+                    status_code=504,
+                    detail="Back-translator timed out.",
+                ) from exc
+            except httpx.RequestError as exc:
+                log.error("/translate proxy: back-translator unreachable: %s", exc)
+                raise HTTPException(
+                    status_code=502,
+                    detail="Cannot reach back-translator.",
+                ) from exc
+
+            # Forward response verbatim — body, status, content-type.
+            return Response(
+                content=upstream.content,
+                status_code=upstream.status_code,
+                media_type=upstream.headers.get("content-type", "application/json"),
+            )
+    except GpuYieldError as yield_err:
+        log.info(
+            "/translate deferred: GPU busy with %s — caller will retry in %ds",
+            yield_err.active, yield_err.retry_after,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "GPU busy with higher-priority services. Try again later.",
+                "active_services": yield_err.active,
+            },
+            headers={"Retry-After": str(yield_err.retry_after)},
+        )
 
 
 if __name__ == "__main__":
