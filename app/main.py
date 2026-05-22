@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import functools
 import io
 import logging
 import os
@@ -637,11 +638,19 @@ async def _transcribe_and_translate_to_lv(
     nllb_src = _WHISPER_TO_NLLB.get(actual_src or "", "eng_Latn")
     log.info("MT: %s → lvs_Latn (%d cues)", nllb_src, len(segments))
 
-    # Translate cue-by-cue (in batches internally) — timecodes unchanged
-    translated_segments = mt.translate_segments(
-        segments,
-        source_lang=nllb_src,
-        target_lang="lvs_Latn",
+    # Translate cue-by-cue (in batches internally) — timecodes unchanged.
+    # Run in executor: MTTranslator uses synchronous `requests`, which would
+    # otherwise block the asyncio event loop for the full MT duration (and
+    # while holding a supervisor claim).
+    loop = asyncio.get_event_loop()
+    translated_segments = await loop.run_in_executor(
+        None,
+        functools.partial(
+            mt.translate_segments,
+            segments,
+            source_lang=nllb_src,
+            target_lang="lvs_Latn",
+        ),
     )
     return translated_segments
 
@@ -1877,23 +1886,20 @@ async def asr_lv_native(
 # ── Lingarr text-translation proxy ─────────────────────────────────────────────
 
 
-@app.post(
-    "/translate",
-    summary="Text translation proxy (claims back-translator-lv via supervisor)",
-    tags=["translation"],
-)
-async def translate_proxy(request: Request) -> Response:
-    """Why: Lingarr currently calls back-translator-lv at :8104 directly, bypassing
-    the GPU supervisor entirely. Routing through this proxy lets Lingarr point at
-    the gateway (port 9001) so the supervisor can mediate claim/release for the
-    text-translation path the same way it does for ASR.
+async def _translate_proxy(request: Request, path: str) -> Response:
+    """Why: Lingarr (and other callers) hit back-translator-lv at :8104 directly,
+    bypassing the GPU supervisor entirely. Routing through a gateway proxy lets
+    the supervisor mediate claim/release for the text-translation path the same
+    way it does for ASR. Factored here so /translate and /translate/batch share
+    a single implementation — they differ only in the upstream path suffix.
     What: Claims back-translator-lv via _supervisor_session, forwards the request
-    body to back-translator-lv's /translate (single-text JSON shape used by Lingarr),
-    and returns the response verbatim. Releases the service after the response.
-    Test: POST a JSON body {"text": "hello", "source_lang": "eng_Latn",
-    "target_lang": "lvs_Latn"} and assert the response status mirrors back-translator's
-    and the JSON includes a "translation" key. With a higher-priority service active,
-    assert a 503 with Retry-After is returned instead.
+    body to f"{BACK_TRANSLATOR_URL}{path}", and returns the response verbatim
+    (body, status_code, content-type). Releases the service after the response.
+    Test: POST /translate with {"text": "hi", "source_lang": "eng_Latn",
+    "target_lang": "lvs_Latn"}; assert status mirrors back-translator's and the
+    JSON has a "translation" key. POST /translate/batch with a list payload;
+    assert it reaches back-translator-lv's /translate/batch. With a
+    higher-priority service active, assert a 503 with Retry-After is returned.
     """
     client = _get_client()
 
@@ -1905,19 +1911,19 @@ async def translate_proxy(request: Request) -> Response:
         async with _supervisor_session(["back-translator-lv"]):
             try:
                 upstream = await client.post(
-                    f"{BACK_TRANSLATOR_URL}/translate",
+                    f"{BACK_TRANSLATOR_URL}{path}",
                     content=body,
                     headers={"content-type": content_type},
                     timeout=MT_TIMEOUT,
                 )
             except httpx.TimeoutException as exc:
-                log.error("/translate proxy: back-translator timeout: %s", exc)
+                log.error("%s proxy: back-translator timeout: %s", path, exc)
                 raise HTTPException(
                     status_code=504,
                     detail="Back-translator timed out.",
                 ) from exc
             except httpx.RequestError as exc:
-                log.error("/translate proxy: back-translator unreachable: %s", exc)
+                log.error("%s proxy: back-translator unreachable: %s", path, exc)
                 raise HTTPException(
                     status_code=502,
                     detail="Cannot reach back-translator.",
@@ -1931,8 +1937,8 @@ async def translate_proxy(request: Request) -> Response:
             )
     except GpuYieldError as yield_err:
         log.info(
-            "/translate deferred: GPU busy with %s — caller will retry in %ds",
-            yield_err.active, yield_err.retry_after,
+            "%s deferred: GPU busy with %s — caller will retry in %ds",
+            path, yield_err.active, yield_err.retry_after,
         )
         return JSONResponse(
             status_code=503,
@@ -1942,6 +1948,37 @@ async def translate_proxy(request: Request) -> Response:
             },
             headers={"Retry-After": str(yield_err.retry_after)},
         )
+
+
+@app.post(
+    "/translate",
+    summary="Text translation proxy (claims back-translator-lv via supervisor)",
+    tags=["translation"],
+)
+async def translate_proxy(request: Request) -> Response:
+    """Why: Lingarr's single-text translation path must go through the supervisor.
+    What: Thin wrapper that delegates to _translate_proxy with path='/translate'.
+    Test: POST {"text": "hi", "source_lang": "eng_Latn", "target_lang": "lvs_Latn"}
+    and assert the response mirrors back-translator-lv's /translate output.
+    """
+    return await _translate_proxy(request, "/translate")
+
+
+@app.post(
+    "/translate/batch",
+    summary="Batch text translation proxy (claims back-translator-lv via supervisor)",
+    tags=["translation"],
+)
+async def translate_batch_proxy(request: Request) -> Response:
+    """Why: Lingarr's batch translation path (many cues in one request) must also
+    go through the supervisor — otherwise long batch jobs at :8104 starve
+    higher-priority services holding their own claims.
+    What: Thin wrapper that delegates to _translate_proxy with path='/translate/batch'.
+    Test: POST a batch payload and assert it reaches back-translator-lv's
+    /translate/batch endpoint with status/body forwarded verbatim. With a
+    higher-priority service active, assert a 503 with Retry-After is returned.
+    """
+    return await _translate_proxy(request, "/translate/batch")
 
 
 if __name__ == "__main__":
