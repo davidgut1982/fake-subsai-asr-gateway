@@ -6,6 +6,7 @@ What: Inserts <repo>/app at position 0 of sys.path at collection time.
 Test: Run `pytest tests/test_utils.py -v` from the repo root with no env vars —
 imports must succeed without ImportError.
 """
+
 from __future__ import annotations
 
 import os
