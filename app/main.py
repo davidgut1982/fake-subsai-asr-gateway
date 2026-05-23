@@ -28,6 +28,7 @@ This gateway is pure HTTP coordination — no GPU, no models.
 
 Host port: 9001
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -43,19 +44,19 @@ import logging
 import os
 import struct
 import time
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from math import gcd
-from typing import Annotated, AsyncGenerator, Optional
+from typing import Annotated, Optional
 
 import httpx
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
-from scipy.signal import resample_poly
-
 from forced_aligner_client import ENABLE_FORCED_ALIGN, ForcedAlignerClient
 from mt_translator import MTTranslator
+from scipy.signal import resample_poly
 from subtitle_utils import segments_to_srt, segments_to_vtt
 from vocal_isolator_client import ENABLED as VOCAL_ISO_ENABLED
 from vocal_isolator_client import VocalIsolatorClient
@@ -121,13 +122,15 @@ API_KEY = os.getenv("API_KEY", "")
 
 # Paths that bypass API key enforcement so health checks, docs, and the status
 # board remain reachable for monitoring without leaking credentials.
-_API_KEY_EXEMPT_PATHS: frozenset[str] = frozenset({
-    "/health",
-    "/status",
-    "/docs",
-    "/redoc",
-    "/openapi.json",
-})
+_API_KEY_EXEMPT_PATHS: frozenset[str] = frozenset(
+    {
+        "/health",
+        "/status",
+        "/docs",
+        "/redoc",
+        "/openapi.json",
+    }
+)
 
 # ── Language code normalization ────────────────────────────────────────────────
 #
@@ -181,29 +184,85 @@ _WHISPER_TO_NLLB: dict[str, str] = {
 
 # Maps Whisper 2-letter code → human-readable language name (for detect-language)
 _LANG_CODE_TO_NAME: dict[str, str] = {
-    "af": "afrikaans", "ar": "arabic", "hy": "armenian", "az": "azerbaijani",
-    "be": "belarusian", "bs": "bosnian", "bg": "bulgarian", "ca": "catalan",
-    "zh": "chinese", "hr": "croatian", "cs": "czech", "da": "danish",
-    "nl": "dutch", "en": "english", "et": "estonian", "fi": "finnish",
-    "fr": "french", "gl": "galician", "de": "german", "el": "greek",
-    "he": "hebrew", "hi": "hindi", "hu": "hungarian", "is": "icelandic",
-    "id": "indonesian", "it": "italian", "ja": "japanese", "kn": "kannada",
-    "kk": "kazakh", "ko": "korean", "lv": "latvian", "lt": "lithuanian",
-    "mk": "macedonian", "ms": "malay", "mr": "marathi", "mi": "maori",
-    "ne": "nepali", "no": "norwegian", "fa": "persian", "pl": "polish",
-    "pt": "portuguese", "ro": "romanian", "ru": "russian", "sr": "serbian",
-    "sk": "slovak", "sl": "slovenian", "es": "spanish", "sw": "swahili",
-    "sv": "swedish", "tl": "tagalog", "ta": "tamil", "th": "thai",
-    "tr": "turkish", "uk": "ukrainian", "ur": "urdu", "vi": "vietnamese",
-    "cy": "welsh", "yi": "yiddish",
-    "nn": "norwegian nynorsk", "nb": "norwegian bokmal",
-    "hy": "armenian", "ka": "georgian", "sq": "albanian",
-    "eu": "basque", "gl": "galician", "lb": "luxembourgish",
-    "mg": "malagasy", "mt": "maltese", "mn": "mongolian",
-    "my": "burmese", "km": "khmer", "lo": "lao",
-    "si": "sinhala", "gu": "gujarati", "bn": "bengali",
-    "pa": "punjabi", "te": "telugu", "ml": "malayalam",
-    "am": "amharic", "tk": "turkmen", "uz": "uzbek",
+    "af": "afrikaans",
+    "ar": "arabic",
+    "hy": "armenian",
+    "az": "azerbaijani",
+    "be": "belarusian",
+    "bs": "bosnian",
+    "bg": "bulgarian",
+    "ca": "catalan",
+    "zh": "chinese",
+    "hr": "croatian",
+    "cs": "czech",
+    "da": "danish",
+    "nl": "dutch",
+    "en": "english",
+    "et": "estonian",
+    "fi": "finnish",
+    "fr": "french",
+    "gl": "galician",
+    "de": "german",
+    "el": "greek",
+    "he": "hebrew",
+    "hi": "hindi",
+    "hu": "hungarian",
+    "is": "icelandic",
+    "id": "indonesian",
+    "it": "italian",
+    "ja": "japanese",
+    "kn": "kannada",
+    "kk": "kazakh",
+    "ko": "korean",
+    "lv": "latvian",
+    "lt": "lithuanian",
+    "mk": "macedonian",
+    "ms": "malay",
+    "mr": "marathi",
+    "mi": "maori",
+    "ne": "nepali",
+    "no": "norwegian",
+    "fa": "persian",
+    "pl": "polish",
+    "pt": "portuguese",
+    "ro": "romanian",
+    "ru": "russian",
+    "sr": "serbian",
+    "sk": "slovak",
+    "sl": "slovenian",
+    "es": "spanish",
+    "sw": "swahili",
+    "sv": "swedish",
+    "tl": "tagalog",
+    "ta": "tamil",
+    "th": "thai",
+    "tr": "turkish",
+    "uk": "ukrainian",
+    "ur": "urdu",
+    "vi": "vietnamese",
+    "cy": "welsh",
+    "yi": "yiddish",
+    "nn": "norwegian nynorsk",
+    "nb": "norwegian bokmal",
+    "ka": "georgian",
+    "sq": "albanian",
+    "eu": "basque",
+    "lb": "luxembourgish",
+    "mg": "malagasy",
+    "mt": "maltese",
+    "mn": "mongolian",
+    "my": "burmese",
+    "km": "khmer",
+    "lo": "lao",
+    "si": "sinhala",
+    "gu": "gujarati",
+    "bn": "bengali",
+    "pa": "punjabi",
+    "te": "telugu",
+    "ml": "malayalam",
+    "am": "amharic",
+    "tk": "turkmen",
+    "uz": "uzbek",
 }
 
 
@@ -252,8 +311,7 @@ def _format_output(
     if fmt == "json":
         payload = {
             "text": " ".join(
-                seg.get("text", "").strip() for seg in segments
-                if seg.get("text", "").strip()
+                seg.get("text", "").strip() for seg in segments if seg.get("text", "").strip()
             ),
             "language": detected_language or "",
             "segments": segments,
@@ -345,15 +403,25 @@ async def _supervisor_session(service_names: list[str]) -> AsyncGenerator[None, 
             try:
                 resp = await _supervisor_post(sup_client, f"/claim/{name}")
                 if resp.status_code == 503:
-                    body = resp.json().get("detail", {}) if resp.headers.get("content-type", "").startswith("application/json") else {}
+                    body = (
+                        resp.json().get("detail", {})
+                        if resp.headers.get("content-type", "").startswith("application/json")
+                        else {}
+                    )
                     if isinstance(body, dict) and body.get("reason") == "tier3_yield":
                         # Release any services claimed before this point
                         for already_claimed in claimed:
                             try:
                                 await _supervisor_post(sup_client, f"/release/{already_claimed}")
-                                log.info("supervisor: released %s (pre-yield cleanup)", already_claimed)
+                                log.info(
+                                    "supervisor: released %s (pre-yield cleanup)", already_claimed
+                                )
                             except Exception as rel_exc:
-                                log.warning("supervisor: cleanup release %s failed: %s", already_claimed, rel_exc)
+                                log.warning(
+                                    "supervisor: cleanup release %s failed: %s",
+                                    already_claimed,
+                                    rel_exc,
+                                )
                         raise GpuYieldError(
                             retry_after=body.get("retry_after_seconds", 60),
                             active=body.get("active_higher_priority", []),
@@ -479,7 +547,10 @@ def _downsample_vocals_for_whisper(vocals_wav: bytes) -> bytes:
         "_downsample_vocals_for_whisper: received unexpected format "
         "samplerate=%d channels=%d subtype=%s size=%d bytes — "
         "performing in-gateway downsample (check vocal-isolator output_format param)",
-        info.samplerate, info.channels, info.subtype, len(vocals_wav),
+        info.samplerate,
+        info.channels,
+        info.subtype,
+        len(vocals_wav),
     )
     audio, src_sr = sf.read(io.BytesIO(vocals_wav), dtype="float32", always_2d=True)
     # audio shape: (samples, channels)
@@ -505,8 +576,8 @@ def _downsample_vocals_for_whisper(vocals_wav: bytes) -> bytes:
 # Chunk size for sending audio to ASR.  5 min at 16 kHz mono int16 ≈ 9.6 MB —
 # well under the 200 MB ASR body limit.  Overlap avoids cutting words at chunk
 # boundaries; overlapping segments are deduplicated after stitching.
-_WHISPER_CHUNK_SECONDS = 300.0   # 5 minutes
-_WHISPER_OVERLAP_SECONDS = 2.0   # 2-second cross-fade zone
+_WHISPER_CHUNK_SECONDS = 300.0  # 5 minutes
+_WHISPER_OVERLAP_SECONDS = 2.0  # 2-second cross-fade zone
 
 
 async def _whisper_chunked(
@@ -557,15 +628,15 @@ async def _whisper_chunked(
         chunk_offset_s = chunk_start / sr
         log.info(
             "whisper-chunk %d/%d  [%.1f-%.1fs  %.1fs total]  size=%d bytes",
-            chunk_idx + 1, n_chunks,
-            chunk_offset_s, chunk_end / sr,
+            chunk_idx + 1,
+            n_chunks,
+            chunk_offset_s,
+            chunk_end / sr,
             total_samples / sr,
             len(chunk_wav),
         )
 
-        chunk_segments, chunk_lang = await _call_asr(
-            client, chunk_wav, "chunk.wav", language, task
-        )
+        chunk_segments, chunk_lang = await _call_asr(client, chunk_wav, "chunk.wav", language, task)
 
         # Keep the first non-empty detected language
         if not detected_lang and chunk_lang:
@@ -584,10 +655,7 @@ async def _whisper_chunked(
         # segment end, with 0.5 s tolerance).
         if all_segments and chunk_idx > 0:
             last_end = all_segments[-1].get("end", 0.0)
-            chunk_segments = [
-                s for s in chunk_segments
-                if s.get("start", 0.0) >= last_end - 0.5
-            ]
+            chunk_segments = [s for s in chunk_segments if s.get("start", 0.0) >= last_end - 0.5]
 
         all_segments.extend(chunk_segments)
 
@@ -619,7 +687,7 @@ async def _call_asr(
     wav_bytes = _ensure_wav(audio_bytes)
     files = {"file": (filename, wav_bytes, "audio/wav")}
     data: dict[str, str] = {
-        "words": "true",   # enables per-word DTW timestamps for tighter cue boundaries
+        "words": "true",  # enables per-word DTW timestamps for tighter cue boundaries
         "vad_filter": "true",
         "task": task,
     }
@@ -674,7 +742,9 @@ async def _transcribe_and_translate_to_lv(
     actual_src = src_lang or detected  # use detected if src not specified
     log.info(
         "_transcribe_and_translate_to_lv: %d segments, src=%s, detected=%s",
-        len(segments), src_lang, detected,
+        len(segments),
+        src_lang,
+        detected,
     )
 
     # Determine NLLB source code — fall back to eng_Latn if unknown
@@ -701,7 +771,7 @@ async def _transcribe_and_translate_to_lv(
 _ALLOWED_AUDIO_EXT = {"flac", "m4a", "mp3", "mp4", "ogg", "wav", "webm"}
 
 
-def _safe_audio_filename(upload: "UploadFile") -> str:
+def _safe_audio_filename(upload: UploadFile) -> str:
     """
     Return a filename guaranteed to have a recognised audio extension.
 
@@ -732,9 +802,19 @@ def _wrap_pcm_as_wav(
     chunk_size = 36 + data_size  # 4 (WAVE) + 24 (fmt chunk) + 8 (data header) + data_size
     header = struct.pack(
         "<4sI4s4sIHHIIHH4sI",
-        b"RIFF", chunk_size, b"WAVE",
-        b"fmt ", 16, 1, channels, sample_rate, byte_rate, block_align, bits,
-        b"data", data_size,
+        b"RIFF",
+        chunk_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits,
+        b"data",
+        data_size,
     )
     return header + pcm_bytes
 
@@ -782,8 +862,8 @@ def _truncate_audio_for_detection(raw: bytes, seconds: int = 30) -> bytes:
         sliced_data = raw[data_start:slice_end]
 
         # Reconstruct: everything up to and including "data" tag + new sizes.
-        header_prefix = raw[: idx + 4]          # bytes 0 … "data"
-        new_data_size = len(sliced_data).to_bytes(4, "little")   # SubChunk2Size
+        header_prefix = raw[: idx + 4]  # bytes 0 … "data"
+        new_data_size = len(sliced_data).to_bytes(4, "little")  # SubChunk2Size
         new_riff_size = (36 + len(sliced_data)).to_bytes(4, "little")  # ChunkSize
         rebuilt = header_prefix + new_data_size + sliced_data
         # Patch bytes 4-8 (RIFF ChunkSize) in the reconstructed buffer.
@@ -808,7 +888,7 @@ def _strip_wav_header(raw: bytes) -> bytes:
     if idx == -1 or idx + 8 > len(raw):
         # Malformed: skip the standard 44-byte header and hope for the best
         return raw[44:]
-    return raw[idx + 8:]  # skip 'data' tag (4) + SubChunk2Size (4)
+    return raw[idx + 8 :]  # skip 'data' tag (4) + SubChunk2Size (4)
 
 
 def _slice_pcm_for_segment(
@@ -920,15 +1000,12 @@ async def _refine_segments_with_alignment(
 
         # Shift relative timestamps → absolute timeline coordinates
         adjusted_words = [
-            {**w, "start": w["start"] + start_s, "end": w["end"] + start_s}
-            for w in words
+            {**w, "start": w["start"] + start_s, "end": w["end"] + start_s} for w in words
         ]
         return {**seg, "words": adjusted_words}
 
     t0 = time.monotonic()
-    refined: list[dict] = list(
-        await asyncio.gather(*(_refine_one(s) for s in segments))
-    )
+    refined: list[dict] = list(await asyncio.gather(*(_refine_one(s) for s in segments)))
     elapsed = time.monotonic() - t0
 
     total = len(segments)
@@ -971,7 +1048,8 @@ async def _isolate_vocals_if_appropriate(
     if duration_s and duration_s < min_audio_s:
         log.info(
             "vocal-isolator: skipping (duration=%.1fs < min=%.0fs)",
-            duration_s, min_audio_s,
+            duration_s,
+            min_audio_s,
         )
         return (audio_bytes, "skipped")
 
@@ -999,7 +1077,9 @@ async def _isolate_vocals_if_appropriate(
         vocals, cache_status = result
         log.info(
             "vocal-isolator: cache_%s, original_size=%d, vocals_size=%d",
-            cache_status, len(audio_bytes), len(vocals),
+            cache_status,
+            len(audio_bytes),
+            len(vocals),
         )
         return (vocals, f"cache_{cache_status}")
     finally:
@@ -1056,15 +1136,17 @@ def _finalize_pipeline_request(
         if status == "failed" and _in_progress_request is not None
         else None
     )
-    _recent_completions.appendleft({
-        "endpoint": endpoint,
-        "video_file": video_file,
-        "started_at": started_at,
-        "ended_at": ended_at,
-        "status": status,
-        "stage_at_failure": stage_at_failure,
-        "duration_sec": ended_at - started_at,
-    })
+    _recent_completions.appendleft(
+        {
+            "endpoint": endpoint,
+            "video_file": video_file,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "status": status,
+            "stage_at_failure": stage_at_failure,
+            "duration_sec": ended_at - started_at,
+        }
+    )
     _in_progress_request = None
 
     # Free Python objects + return glibc arena memory to OS so RSS drops back
@@ -1109,8 +1191,14 @@ async def status_page() -> HTMLResponse:
     dep_urls = [
         ("asr-transcription-lv", f"{ASR_URL}/health"),
         ("back-translator-lv", f"{BACK_TRANSLATOR_URL}/health"),
-        ("vocal-isolator-lv", f"{os.environ.get('VOCAL_ISOLATOR_URL', 'http://localhost:8106')}/health"),
-        ("forced-aligner-lv", f"{os.environ.get('FORCED_ALIGNER_URL', 'http://localhost:8102')}/health"),
+        (
+            "vocal-isolator-lv",
+            f"{os.environ.get('VOCAL_ISOLATOR_URL', 'http://localhost:8106')}/health",
+        ),
+        (
+            "forced-aligner-lv",
+            f"{os.environ.get('FORCED_ALIGNER_URL', 'http://localhost:8102')}/health",
+        ),
     ]
     dep_results: dict[str, str] = {}
     for name, url in dep_urls:
@@ -1157,7 +1245,11 @@ async def status_page() -> HTMLResponse:
                 f"  {i}. {html.escape(str(entry['endpoint']))}  {html.escape(vf)}   "
                 f"(waiting {html.escape(_fmt_duration(waited))})"
             )
-        queue_html = '<div class="section"><div class="section-title">QUEUE (in order)</div>\n' + "\n".join(rows) + "\n</div>"
+        queue_html = (
+            '<div class="section"><div class="section-title">QUEUE (in order)</div>\n'
+            + "\n".join(rows)
+            + "\n</div>"
+        )
     else:
         queue_html = '<div class="section"><div class="section-title">QUEUE</div>  (empty)\n</div>'
 
@@ -1168,7 +1260,9 @@ async def status_page() -> HTMLResponse:
             duration = entry["ended_at"] - entry["started_at"]
             vf = (str(entry.get("video_file") or "(unknown)"))[:55]
             status = str(entry.get("status", "?")).upper()
-            status_class = "ok" if status == "COMPLETE" else "err"
+            status_class = (
+                "ok" if status == "COMPLETE" else ("warn" if status == "DEFERRED" else "err")
+            )
             if status == "FAILED":
                 stage_info = f"  stage={html.escape(str(entry.get('stage_at_failure', '?')))}"
             else:
@@ -1200,7 +1294,7 @@ async def status_page() -> HTMLResponse:
         + "\n</div>"
     )
 
-    html = f"""<!DOCTYPE html>
+    page_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -1221,6 +1315,7 @@ async def status_page() -> HTMLResponse:
   .section-title {{ color: #7090b0; font-size: 12px; letter-spacing: 1px;
                     border-bottom: 1px solid #222; margin-bottom: 6px; padding-bottom: 2px; }}
   .ok {{ color: #50c050; }}
+  .warn {{ color: #f0c060; }}
   .err {{ color: #e05050; }}
 </style>
 </head>
@@ -1234,7 +1329,7 @@ async def status_page() -> HTMLResponse:
 {deps_html}
 </body>
 </html>"""
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=page_html)
 
 
 @app.get("/health", summary="Health check", tags=["health"])
@@ -1308,7 +1403,9 @@ async def detect_language(
 
     log.info(
         "/detect-language  file=%s size=%d bytes  video_file=%s",
-        filename, len(audio_bytes), video_file,
+        filename,
+        len(audio_bytes),
+        video_file,
     )
 
     # Truncate to first 30 seconds before sending to ASR.
@@ -1326,10 +1423,12 @@ async def detect_language(
     detected_name = _LANG_CODE_TO_NAME.get(detected_code, detected_code)
 
     log.info("/detect-language  result: code=%s name=%s", detected_code, detected_name)
-    return JSONResponse({
-        "detected_language": detected_name,
-        "language_code": detected_code,
-    })
+    return JSONResponse(
+        {
+            "detected_language": detected_name,
+            "language_code": detected_code,
+        }
+    )
 
 
 @app.post(
@@ -1452,7 +1551,12 @@ async def asr_smart(
 
             log.info(
                 "/asr  file=%s size=%d target_lang=%s task=%s output=%s  video_file=%s",
-                filename, len(audio_bytes), target_lang, asr_task, output_fmt, video_file,
+                filename,
+                len(audio_bytes),
+                target_lang,
+                asr_task,
+                output_fmt,
+                video_file,
             )
 
             try:
@@ -1516,7 +1620,9 @@ async def asr_smart(
                         )
                         log.info(
                             "/asr translate done: %d segs, detected src=%s, isolation=%s",
-                            len(segments), detected, iso_status,
+                            len(segments),
+                            detected,
+                            iso_status,
                         )
                         result = _format_output(segments, output_fmt, detected)
                     else:
@@ -1527,7 +1633,9 @@ async def asr_smart(
                         detected_src = detected_src or "en"
                         log.info(
                             "/asr detected src=%s target=%s segs=%d",
-                            detected_src, target_lang, len(segments),
+                            detected_src,
+                            target_lang,
+                            len(segments),
                         )
 
                         # ── Forced-alignment refinement (Latvian audio only) ─────────────
@@ -1539,12 +1647,20 @@ async def asr_smart(
 
                         # No target specified
                         if target_lang is None:
-                            log.info("/asr complete: isolation=%s, segments=%d", iso_status, len(segments))
+                            log.info(
+                                "/asr complete: isolation=%s, segments=%d",
+                                iso_status,
+                                len(segments),
+                            )
                             result = _format_output(segments, output_fmt, detected_src)
 
                         # Same source and target
                         elif target_lang == detected_src:
-                            log.info("/asr complete: isolation=%s, segments=%d", iso_status, len(segments))
+                            log.info(
+                                "/asr complete: isolation=%s, segments=%d",
+                                iso_status,
+                                len(segments),
+                            )
                             result = _format_output(segments, output_fmt, detected_src)
 
                         # Target is English
@@ -1552,9 +1668,16 @@ async def asr_smart(
                             if detected_src != "en":
                                 _in_progress_request["stage"] = "whisper-translate"
                                 segments, _ = await _whisper_chunked(
-                                    audio_for_asr, language=detected_src, task="translate", client=client
+                                    audio_for_asr,
+                                    language=detected_src,
+                                    task="translate",
+                                    client=client,
                                 )
-                            log.info("/asr complete: isolation=%s, segments=%d", iso_status, len(segments))
+                            log.info(
+                                "/asr complete: isolation=%s, segments=%d",
+                                iso_status,
+                                len(segments),
+                            )
                             result = _format_output(segments, output_fmt, "en")
 
                         # Target is Latvian
@@ -1565,20 +1688,32 @@ async def asr_smart(
                             # already 16 kHz mono int16 WAV so _call_asr/_ensure_wav handle
                             # it correctly without any double-conversion.
                             translated = await _transcribe_and_translate_to_lv(
-                                client, mt, audio_for_asr, filename,
+                                client,
+                                mt,
+                                audio_for_asr,
+                                filename,
                                 src_lang=detected_src,
                                 asr_task="transcribe",
                             )
-                            log.info("/asr complete: isolation=%s, segments=%d", iso_status, len(translated))
+                            log.info(
+                                "/asr complete: isolation=%s, segments=%d",
+                                iso_status,
+                                len(translated),
+                            )
                             result = _format_output(translated, output_fmt, "lv")
 
                         # Fallback
                         else:
                             log.warning(
                                 "/asr unsupported target_lang=%s — returning source language %s",
-                                target_lang, detected_src,
+                                target_lang,
+                                detected_src,
                             )
-                            log.info("/asr complete: isolation=%s, segments=%d", iso_status, len(segments))
+                            log.info(
+                                "/asr complete: isolation=%s, segments=%d",
+                                iso_status,
+                                len(segments),
+                            )
                             result = _format_output(segments, output_fmt, detected_src)
 
                     _in_progress_request["stage"] = "done"
@@ -1609,7 +1744,8 @@ async def asr_smart(
         # service is active. Return 503 + Retry-After to Bazarr so it retries naturally.
         log.info(
             "/asr deferred: GPU busy with %s — Bazarr will retry in %ds",
-            yield_err.active, yield_err.retry_after,
+            yield_err.active,
+            yield_err.retry_after,
         )
         return JSONResponse(
             status_code=503,
@@ -1717,7 +1853,10 @@ async def asr_translate_lv(
 
             log.info(
                 "/asr-translate-lv  file=%s lang=%s output=%s size=%d bytes",
-                filename, asr_lang, output_fmt, len(audio_bytes),
+                filename,
+                asr_lang,
+                output_fmt,
+                len(audio_bytes),
             )
 
             try:
@@ -1759,7 +1898,8 @@ async def asr_translate_lv(
         # service is active. Return 503 + Retry-After to Bazarr so it retries naturally.
         log.info(
             "/asr-translate-lv deferred: GPU busy with %s — Bazarr will retry in %ds",
-            yield_err.active, yield_err.retry_after,
+            yield_err.active,
+            yield_err.retry_after,
         )
         return JSONResponse(
             status_code=503,
@@ -1859,7 +1999,10 @@ async def asr_lv_native(
 
             log.info(
                 "/asr-lv-native  file=%s lang=%s output=%s size=%d bytes",
-                filename, lang, output_fmt, len(audio_bytes),
+                filename,
+                lang,
+                output_fmt,
+                len(audio_bytes),
             )
 
             try:
@@ -1903,7 +2046,8 @@ async def asr_lv_native(
         # service is active. Return 503 + Retry-After to Bazarr so it retries naturally.
         log.info(
             "/asr-lv-native deferred: GPU busy with %s — Bazarr will retry in %ds",
-            yield_err.active, yield_err.retry_after,
+            yield_err.active,
+            yield_err.retry_after,
         )
         return JSONResponse(
             status_code=503,
@@ -1979,7 +2123,9 @@ async def _translate_proxy(request: Request, path: str) -> Response:
     except GpuYieldError as yield_err:
         log.info(
             "%s deferred: GPU busy with %s — caller will retry in %ds",
-            path, yield_err.active, yield_err.retry_after,
+            path,
+            yield_err.active,
+            yield_err.retry_after,
         )
         return JSONResponse(
             status_code=503,
@@ -2024,4 +2170,5 @@ async def translate_batch_proxy(request: Request) -> Response:
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=9001)
