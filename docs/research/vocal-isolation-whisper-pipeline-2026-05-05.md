@@ -1,7 +1,7 @@
 # Research: Vocal Isolation + Whisper ASR — Existing Open-Source Solutions
 
-**Date**: 2026-05-05  
-**Context**: Bazarr subtitle generation for Latvian movie/TV content. Single RTX 3060 12GB. Need Demucs/UVR vocal isolation before Whisper to suppress hallucinations on music sections.  
+**Date**: 2026-05-05
+**Context**: Bazarr subtitle generation for Latvian movie/TV content. Single RTX 3060 12GB. Need Demucs/UVR vocal isolation before Whisper to suppress hallucinations on music sections.
 **Search engines used**: Exa + Tavily (cross-validated)
 
 ---
@@ -10,10 +10,10 @@
 
 ### 1. ventura8/Whisper-Pro-ASR
 
-**GitHub**: https://github.com/ventura8/Whisper-Pro-ASR  
-**Docker Hub**: https://hub.docker.com/r/ventura8/whisper-pro-asr  
-**Stars**: 1 (tiny project, single contributor)  
-**Last commit**: 2026-02-01 (v1.0.0 release)  
+**GitHub**: https://github.com/ventura8/Whisper-Pro-ASR
+**Docker Hub**: https://hub.docker.com/r/ventura8/whisper-pro-asr
+**Stars**: 1 (tiny project, single contributor)
+**Last commit**: 2026-02-01 (v1.0.0 release)
 **License**: MIT
 
 This is the closest match to exactly what we built. It is a drop-in replacement for `ahmetoner/whisper-asr-webservice`, explicitly targeting Bazarr integration, implementing the identical `/asr` and `/detect-language` endpoints, and adding **UVR/MDX-NET vocal isolation as a first-class preprocessing stage** that runs before every transcription. It uses `faster-whisper` with `Systran/faster-whisper-large-v3` by default, supports int8/float16 compute types, and ships a complete `docker-compose.yml`.
@@ -26,9 +26,9 @@ The preprocessing pipeline: FFmpeg normalize → UVR MDX-NET vocal isolation (GP
 
 ### 2. EtienneAb3d/WhisperHallu
 
-**GitHub**: https://github.com/EtienneAb3d/WhisperHallu  
-**Stars**: 349  
-**Last commit**: 2024-11-12  
+**GitHub**: https://github.com/EtienneAb3d/WhisperHallu
+**Stars**: 349
+**Last commit**: 2024-11-12
 **License**: implicit (research/commercial — "demonstration of our know-how")
 
 The original proof-of-concept that named the problem. It combines Demucs or Spleeter for vocal extraction, Silero VAD for silence removal, ffmpeg loudness normalization, a speech compressor, and a "voice marker" hallucination-detection trick (inject inaudible markers; if Whisper echoes them back, transcription is valid). Supports openai-whisper and faster-whisper backends.
@@ -41,9 +41,9 @@ The hallucination marker trick is clever and unique to this project. However it 
 
 ### 3. LunarCommand/audio-refinery
 
-**GitHub**: https://github.com/LunarCommand/audio-refinery  
-**Stars**: 0 (brand new, Feb–March 2026)  
-**Last commit**: 2026-03-06  
+**GitHub**: https://github.com/LunarCommand/audio-refinery
+**Stars**: 0 (brand new, Feb–March 2026)
+**Last commit**: 2026-03-06
 **License**: MIT
 
 The most technically sophisticated pipeline found. Implements what the author calls the "Ghost Track strategy": run all AI models (Demucs, Pyannote diarization, WhisperX) against the clean vocal stem extracted by `htdemucs --two-stems=vocals`, then apply resulting timestamps/text back to original. Includes Wav2Vec2 forced alignment via WhisperX for word-level timestamps. Batch pipeline with per-file VRAM cleanup. Designed for 24GB GPUs with all models resident simultaneously.
@@ -56,9 +56,9 @@ Handles long-form via `--segment N` flag on Demucs and batch-size controls on Wh
 
 ### 4. McCloudS/subgen
 
-**GitHub**: https://github.com/McCloudS/subgen  
-**Stars**: ~1000+ (active project)  
-**Bazarr-compatible**: Yes (implements whisper-asr-webservice protocol)  
+**GitHub**: https://github.com/McCloudS/subgen
+**Stars**: ~1000+ (active project)
+**Bazarr-compatible**: Yes (implements whisper-asr-webservice protocol)
 **Last commit**: Active as of 2026
 
 This is the project Bazarr's wiki actually points to as the canonical whisper-asr-webservice backend. Uses `faster-whisper` + `stable-ts` under the hood. Speaks the exact Bazarr whisper protocol. Ships Docker image with GPU support. **No vocal isolation whatsoever.** Handles chunking via stable-ts. Actively maintained. The Bazarr wiki page for the Whisper provider says "Bazarr's Whisper provider communicates with SubGen."
@@ -69,10 +69,10 @@ This is the project Bazarr's wiki actually points to as the canonical whisper-as
 
 ### 5. absadiki/subsai
 
-**GitHub**: https://github.com/absadiki/subsai  
-**Stars**: 1648  
-**Forks**: 140  
-**Last commit**: Active  
+**GitHub**: https://github.com/absadiki/subsai
+**Stars**: 1648
+**Forks**: 140
+**Last commit**: Active
 **License**: GPL-3
 
 A subtitle generation tool (Web UI + CLI + Python package) supporting openai-whisper, faster-whisper, whisperX, stable-ts, whisper.cpp, and HuggingFace Transformers backends — all switchable. Includes subtitle format conversion and auto-sync. Ships Docker image. **No vocal isolation preprocessing.** This is the "SubsAI" project implied by the Bazarr provider name — the provider is named `whisperai` and the service was historically called SubsAI, but the actual Bazarr integration now points at SubGen and ahmetoner's webservice, not this package.
@@ -83,9 +83,9 @@ A subtitle generation tool (Web UI + CLI + Python package) supporting openai-whi
 
 ### 6. ahmetoner/whisper-asr-webservice
 
-**GitHub**: https://github.com/ahmetoner/whisper-asr-webservice  
-**Stars**: Several thousand (major project)  
-**Last commit**: Active, 321 commits  
+**GitHub**: https://github.com/ahmetoner/whisper-asr-webservice
+**Stars**: Several thousand (major project)
+**Last commit**: Active, 321 commits
 **License**: MIT
 
 The reference implementation of the Bazarr whisper protocol. Supports openai_whisper and faster_whisper backends. **No vocal isolation.** The issues list shows active discussion of adding diarization, sentiment, and VAD features, but no vocal isolation PRs. No fork in the network adds vocal isolation based on search results — ventura8/Whisper-Pro-ASR appears to be a from-scratch reimplementation that is *compatible with* this protocol, not a fork of it.
@@ -94,8 +94,8 @@ The reference implementation of the Bazarr whisper protocol. Supports openai_whi
 
 ### 7. Nightingale (rzru/nightingale)
 
-**GitHub**: https://github.com/rzru/nightingale  
-**Stars**: modest (newer project, March 2026)  
+**GitHub**: https://github.com/rzru/nightingale
+**Stars**: modest (newer project, March 2026)
 **License**: MIT
 
 A karaoke desktop app (Tauri/Rust + React) that implements the exact pipeline: UVR Karaoke model or Demucs for vocal isolation → WhisperX large-v3 for transcription with forced Wav2Vec2 alignment → word-level synchronized playback. Proves the pipeline works end-to-end for long-form audio. However: desktop app, not a service, no HTTP API, no Bazarr integration, music-focused (assumes songs, not TV dialogue).
