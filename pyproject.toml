@@ -1,0 +1,8 @@
+[project]
+name = "fake-subsai-asr-gateway"
+version = "1.0.0"
+description = "Bazarr-compatible ASR and machine translation gateway"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
