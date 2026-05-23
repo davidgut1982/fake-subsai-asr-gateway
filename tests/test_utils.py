@@ -11,13 +11,13 @@ or raw bytes); no real files are read or written.
 Test: Run `pytest tests/test_utils.py -v` from the repo root. All tests should
 pass without `API_KEY`, network, or GPU access.
 """
+
 from __future__ import annotations
 
 import json
 import struct
 
 import pytest
-
 from main import (
     _ISO3_TO_ISO1,
     _WHISPER_TO_NLLB,
@@ -26,7 +26,6 @@ from main import (
     _normalize_lang,
     _wrap_pcm_as_wav,
 )
-
 
 # ── _normalize_lang ────────────────────────────────────────────────────────────
 
@@ -99,9 +98,19 @@ def _make_riff_wav(payload: bytes = b"\x00\x00" * 8) -> bytes:
     return (
         struct.pack(
             "<4sI4s4sIHHIIHH4sI",
-            b"RIFF", chunk_size, b"WAVE",
-            b"fmt ", 16, 1, 1, 16000, 32000, 2, 16,
-            b"data", data_size,
+            b"RIFF",
+            chunk_size,
+            b"WAVE",
+            b"fmt ",
+            16,
+            1,
+            1,
+            16000,
+            32000,
+            2,
+            16,
+            b"data",
+            data_size,
         )
         + payload
     )
