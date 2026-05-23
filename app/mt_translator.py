@@ -15,6 +15,7 @@ Language codes (NLLB-200 / FLORES-200):
   lvs_Latn — Latvian Standard (Latin script)
   NOTE: lav_Latn resolves to <unk> in the NLLB tokenizer — always use lvs_Latn.
 """
+
 from __future__ import annotations
 
 import logging
@@ -84,7 +85,7 @@ class MTTranslator:
 
         # Reconstruct segments with translated text
         out = [dict(s) for s in segments]
-        for idx, translated in zip(indices_to_translate, translated_texts):
+        for idx, translated in zip(indices_to_translate, translated_texts, strict=False):
             out[idx] = {**out[idx], "text": translated}
         return out
 
@@ -166,7 +167,8 @@ class MTTranslator:
             # Mismatched count — fall back
             log.warning(
                 "Batch returned %d translations for %d inputs — falling back to sequential",
-                len(translations), len(texts),
+                len(translations),
+                len(texts),
             )
         except requests.RequestException as exc:
             log.warning("Batch MT failed (%s) — falling back to sequential", exc)
