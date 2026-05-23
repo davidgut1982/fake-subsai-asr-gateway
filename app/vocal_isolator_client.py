@@ -54,16 +54,12 @@ class VocalIsolatorClient:
             }
             r = await self._client.post("/isolate", files=files, data=data)
             if r.status_code != 200:
-                log.warning(
-                    "vocal-isolator returned %d: %s", r.status_code, r.text[:200]
-                )
+                log.warning("vocal-isolator returned %d: %s", r.status_code, r.text[:200])
                 return None
             cache_status = r.headers.get("X-Cache", "unknown")
             return (r.content, cache_status)
         except Exception as e:
-            log.warning(
-                "vocal-isolator request failed: %s: %s", type(e).__name__, e
-            )
+            log.warning("vocal-isolator request failed: %s: %s", type(e).__name__, e)
             return None
 
     async def health(self) -> bool:
