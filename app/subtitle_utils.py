@@ -18,6 +18,7 @@ VTT format spec:
   <text>
   <blank line>
 """
+
 from __future__ import annotations
 
 import re
