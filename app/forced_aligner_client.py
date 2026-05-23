@@ -23,6 +23,7 @@ Callers must add segment.start to convert to absolute timeline offsets.
 Feature flag: ENABLE_FORCED_ALIGN env var (default "true").
 Kill-switch: set ENABLE_FORCED_ALIGN=false to bypass entirely.
 """
+
 from __future__ import annotations
 
 import logging
@@ -37,13 +38,9 @@ log = logging.getLogger("fake-subsai-gateway.aligner")
 
 # Internal Docker DNS name used when both services share a Docker bridge network.
 # With host-network mode on the gateway, use the host-mapped port instead.
-FORCED_ALIGNER_URL: str = os.environ.get(
-    "FORCED_ALIGNER_URL", "http://localhost:8102"
-)
+FORCED_ALIGNER_URL: str = os.environ.get("FORCED_ALIGNER_URL", "http://localhost:8102")
 
-ENABLE_FORCED_ALIGN: bool = (
-    os.environ.get("ENABLE_FORCED_ALIGN", "true").lower().strip() == "true"
-)
+ENABLE_FORCED_ALIGN: bool = os.environ.get("ENABLE_FORCED_ALIGN", "true").lower().strip() == "true"
 
 # Per-request timeout in seconds.  The aligner runs on CPU and can be slow for
 # long segments; 30 s is generous but prevents indefinite hangs.
@@ -114,7 +111,8 @@ class ForcedAlignerClient:
             if response.status_code != 200:
                 log.debug(
                     "forced-aligner returned HTTP %d for text %r",
-                    response.status_code, text[:40],
+                    response.status_code,
+                    text[:40],
                 )
                 return None
 
